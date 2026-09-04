@@ -181,8 +181,37 @@ async function attachStops(
   });
 }
 
+async function toobitPositionAmt(account: ExchangeAccount, symbol: string): Promise<number | null> {
+  if (!account.apiKey || !account.apiSecret) return null;
+  try {
+    const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
+      symbol,
+    })) as Array<{ position?: string | number; positionAmt?: string | number }>;
+    const list = Array.isArray(rows) ? rows : [];
+    const row = list.find((r) => Number(r.position ?? r.positionAmt) !== 0) ?? list[0];
+    if (!row) return 0;
+    return Math.abs(Number(row.position ?? row.positionAmt ?? 0)) || 0;
+  } catch {
+    return null;
+  }
+}
+
+async function waitToobitFlat(account: ExchangeAccount, symbol: string): Promise<"flat" | "open" | "unknown"> {
+  let last: number | null = null;
+  for (let i = 0; i < 3; i++) {
+    last = await toobitPositionAmt(account, symbol);
+    if (last === 0) return "flat";
+    if (i < 2) await sleep(300);
+  }
+  if (last == null) return "unknown";
+  return last === 0 ? "flat" : "open";
+}
+
 async function marketCloseToobit(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   if (!account.apiKey || !account.apiSecret) return { ok: false, message: "Toobit API key missing" };
+  const amt = await toobitPositionAmt(account, symbol);
+  if (amt == null) return { ok: false, message: "Toobit position read failed before close" };
+  if (!amt) return { ok: true, message: "flat" };
   const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
     symbol,
   })) as Array<{ position: string; side?: string }>;
@@ -199,6 +228,16 @@ async function marketCloseToobit(account: ExchangeAccount, symbol: string): Prom
     quantity: Math.abs(Number(row.position)),
     newClientOrderId: `apex-c-${Date.now()}`,
   });
+  const state = await waitToobitFlat(account, symbol);
+  if (state !== "flat") {
+    return {
+      ok: false,
+      message:
+        state === "unknown"
+          ? "Toobit close unconfirmed — SL/TP left in place"
+          : "Toobit close left a remainder — SL/TP left in place",
+    };
+  }
   return { ok: true, message: "closed" };
 }
 

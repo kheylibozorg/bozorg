@@ -146,6 +146,25 @@ async function coinPositionSize(account: ExchangeAccount, coin: string): Promise
   return Math.abs(Number(pos?.position?.szi ?? 0));
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function waitHlFlat(account: ExchangeAccount, coin: string): Promise<"flat" | "open" | "unknown"> {
+  let last: number | null = null;
+  for (let i = 0; i < 3; i++) {
+    try {
+      last = await coinPositionSize(account, coin);
+      if (last === 0) return "flat";
+    } catch {
+      last = null;
+    }
+    if (i < 2) await sleep(300);
+  }
+  if (last == null) return "unknown";
+  return last === 0 ? "flat" : "open";
+}
+
 async function marketCloseHl(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   if (!account.privateKey) return { ok: false, message: "Hyperliquid private key missing" };
   const user = masterAddress(account);
@@ -187,12 +206,22 @@ async function marketCloseHl(account: ExchangeAccount, symbol: string): Promise<
 async function closeAndDisarm(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   const closed = await marketCloseHl(account, symbol);
   if (!closed.ok && closed.message !== "flat") return closed;
+  const { meta } = await loadMeta();
+  const hit = assetOf(meta, symbol);
+  if (!hit) {
+    return { ok: false, message: "Hyperliquid close unconfirmed — SL/TP left in place" };
+  }
+  const state = closed.message === "flat" ? "flat" : await waitHlFlat(account, hit.coin);
+  if (state !== "flat") {
+    return {
+      ok: false,
+      message:
+        state === "unknown"
+          ? "Hyperliquid close unconfirmed — SL/TP left in place"
+          : "Hyperliquid close left a remainder — SL/TP left in place",
+    };
+  }
   try {
-    const { meta } = await loadMeta();
-    const hit = assetOf(meta, symbol);
-    if (!hit) return closed;
-    const left = await coinPositionSize(account, hit.coin);
-    if (left > 0) return { ok: false, message: "Hyperliquid close left a remainder" };
     const leftover = await listTriggers(account, hit.coin);
     await cancelOids(
       account,
@@ -200,9 +229,9 @@ async function closeAndDisarm(account: ExchangeAccount, symbol: string): Promise
       leftover.map((o) => Number(o.oid)),
     );
   } catch {
-    /* position is already flat */
+    /* leftover triggers are optional once flat */
   }
-  return closed;
+  return closed.message === "flat" ? closed : { ok: true, orderId: closed.orderId, message: "closed" };
 }
 
 function flattenMessage(closed: PlaceOrderResult, why: string, orderId?: string): PlaceOrderResult {
