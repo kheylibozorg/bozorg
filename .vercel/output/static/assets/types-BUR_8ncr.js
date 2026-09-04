@@ -1,0 +1,1 @@
+function e(e){return e===`APEX1`?`1R`:e===`APEX15`?`1.5R`:e===`APEX2`?`2R`:e===`HAEG`?`Aegis`:e===`HVES`?`Vesper`:e===`HORI`?`Orion`:e===`HALC`?`Coil`:e===`TREX1`?`T1.0`:e===`TREX12`?`T1.2`:e===`KETEX`?`KETEX`:e===`SHETEX`?`SHETEX`:e}var t={"5m":3e5,"15m":9e5,"1h":36e5,"4h":144e5,"1d":864e5,"1w":6048e5};export{e as n,t};

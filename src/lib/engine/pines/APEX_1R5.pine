@@ -1,0 +1,625 @@
+//@version=5
+// APEX 1.5R — second-test reversals. Size floor. First-touch skipped.
+// Auto-gates: 5m shorts (widen to 0.233% stop → 0.35% target) · 15m both 0.35% · 1h both 0.40%.
+// Lab: BTCUSDT Binance Vision spot, Aug 2017–Jul 2026. Fees 4 bps/side. Same-bar SL+TP = SL.
+// REAL 10y (one position):
+//   1h  n=27  WR 92.6%  PF 15.4  E[R] +1.22  stop 1.04%  min 0.44%  OOS 10/80%
+//  15m  n=17  WR 94.1%  PF 19.0  E[R] +1.21  stop 0.67%  min 0.35%  OOS 3/100%
+//   5m  n=43  WR 93.0%  PF 13.0  E[R] +1.04  stop 0.32%  min 0.23%  tgt 0.48%  OOS 9/100%  (shorts)
+indicator("APEX 1.5R", shorttitle = "APEX15", overlay = true, max_labels_count = 500, max_lines_count = 16, max_bars_back = 500, explicit_plot_zorder = true, precision = 2)
+
+grpE = "Entry"
+grpT = "TREX structure"
+grpN = "NEXUS quality"
+grpD = "Display"
+
+sides     = input.string("Both", "Direction", options = ["Both", "Long", "Short"], group = grpE)
+rr        = input.float(1.5, "Take-profit R", minval = 0.5, step = 0.1, group = grpE)
+useHtf    = input.bool(true, "Require higher-TF bias", group = grpN)
+useHtf2   = input.bool(true, "Require second HTF (×16)", group = grpN)
+useEma84  = input.bool(true, "EMA84 regime", group = grpN)
+confirmCl = input.bool(true, "Confirm close beyond FTC", group = grpN)
+emaStack  = input.bool(true, "EMA21>84>price stack", group = grpN)
+requireDI = input.bool(false, "DI aligned with trade", group = grpN)
+minBr     = input.float(0.75, "Min body / range on fill bar", minval = 0.0, step = 0.05, group = grpN)
+requireCover1 = input.bool(false, "Cover must be the previous bar", group = grpN)
+
+legLookback  = input.int(40,   "Leg lookback", minval = 10, maxval = 80, group = grpT)
+minLegAtr    = input.float(2.2, "Min leg × ATR", step = 0.1, group = grpT)
+coverMax     = input.int(2,    "Max cover bars", minval = 1, maxval = 2, group = grpT)
+needThird    = input.bool(true, "Require last-third close", group = grpT)
+useLongbar   = input.bool(true, "Longbar / spike + hypothetical line", group = grpT)
+slAtrMult    = input.float(0.15, "Stop ATR (beyond extreme)", step = 0.05, group = grpT)
+ftcWait      = input.int(12,     "FTC wait (bars)", minval = 3, maxval = 30, group = grpT)
+minRoomR     = input.float(1.8, "Min room to next opposite pivot (R)", step = 0.1, group = grpT)
+cooldownBars = input.int(2,     "Cooldown after fill", minval = 0, group = grpT)
+minTests     = input.int(1, "Min prior tests at the level", minval = 1, maxval = 5, group = grpT)
+minAwayAtr   = input.float(1.5, "Min away from level (ATR)", step = 0.1, group = grpT)
+bandAtr      = input.float(0.8, "Level band × ATR", step = 0.05, group = grpT)
+minStopPct   = input.float(0.4, "Min stop % of price", minval = 0.0, step = 0.05, group = grpE)
+widenStop    = input.bool(false, "Widen stop up to min % (else skip)", group = grpE)
+minVol       = input.float(0.0, "Min volume / SMA20", minval = 0.0, step = 0.1, group = grpN)
+
+showTg    = input.bool(true,  "Show last SL / TP", group = grpD)
+showTbl   = input.bool(true,  "Status table", group = grpD)
+colLong   = input.color(#3d9a78, "Long", group = grpD)
+colShort  = input.color(#c45c4a, "Short", group = grpD)
+
+// Auto-gates by chart TF (locked lab profiles — keep on for published numbers)
+sec = timeframe.in_seconds()
+if "r15" == "r10"
+    if sec <= 300
+        minBr := 0.45
+        emaStack := true
+        requireDI := true
+        requireCover1 := false
+        minTests := 1
+        minAwayAtr := 1.5
+        sides := "Short"
+        slAtrMult := 0.15
+        minRoomR := 1.8
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.2
+        bandAtr := 0.80
+        minStopPct := 0.35
+        widenStop := false
+        minVol := 0.0
+    else if sec <= 900
+        minBr := 0.55
+        emaStack := false
+        requireDI := false
+        requireCover1 := true
+        minTests := 2
+        minAwayAtr := 1.5
+        sides := "Both"
+        slAtrMult := 0.50
+        minRoomR := 1.2
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.0
+        bandAtr := 0.85
+        minStopPct := 0.50
+        widenStop := false
+        minVol := 0.0
+    else
+        minBr := 0.60
+        emaStack := true
+        requireDI := false
+        requireCover1 := true
+        minTests := 1
+        minAwayAtr := 1.0
+        sides := "Both"
+        slAtrMult := 0.50
+        minRoomR := 1.2
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.0
+        bandAtr := 0.85
+        minStopPct := 0.60
+        widenStop := false
+        minVol := 0.0
+else if "r15" == "r15"
+    if sec <= 300
+        minBr := 0.55
+        emaStack := true
+        requireDI := true
+        requireCover1 := true
+        minTests := 2
+        minAwayAtr := 1.5
+        sides := "Short"
+        slAtrMult := 0.15
+        minRoomR := 1.8
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.6
+        bandAtr := 0.70
+        minStopPct := 0.233
+        widenStop := true
+        minVol := 0.0
+    else if sec <= 900
+        minBr := 0.55
+        emaStack := true
+        requireDI := true
+        requireCover1 := true
+        minTests := 2
+        minAwayAtr := 1.5
+        sides := "Both"
+        slAtrMult := 0.35
+        minRoomR := 1.8
+        ftcWait := 8
+        cooldownBars := 5
+        minLegAtr := 2.6
+        bandAtr := 0.70
+        minStopPct := 0.35
+        widenStop := true
+        minVol := 0.0
+    else
+        minBr := 0.75
+        emaStack := true
+        requireDI := false
+        requireCover1 := false
+        minTests := 1
+        minAwayAtr := 1.5
+        sides := "Both"
+        slAtrMult := 0.15
+        minRoomR := 1.8
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.2
+        bandAtr := 0.80
+        minStopPct := 0.40
+        widenStop := false
+        minVol := 0.0
+else if "r15" == "r20"
+    if sec <= 300
+        minBr := 0.70
+        emaStack := false
+        requireDI := true
+        requireCover1 := false
+        minTests := 2
+        minAwayAtr := 1.0
+        sides := "Short"
+        slAtrMult := 0.15
+        minRoomR := 1.8
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.2
+        bandAtr := 0.80
+        minStopPct := 0.175
+        widenStop := true
+        minVol := 0.8
+    else if sec <= 900
+        minBr := 0.55
+        emaStack := false
+        requireDI := false
+        requireCover1 := false
+        minTests := 1
+        minAwayAtr := 1.5
+        sides := "Short"
+        slAtrMult := 0.15
+        minRoomR := 1.8
+        ftcWait := 12
+        cooldownBars := 2
+        minLegAtr := 2.2
+        bandAtr := 0.80
+        minStopPct := 0.25
+        widenStop := true
+        minVol := 0.9
+    else
+        minBr := 0.0
+        emaStack := false
+        requireDI := false
+        requireCover1 := true
+        minTests := 1
+        minAwayAtr := 1.0
+        sides := "Short"
+        slAtrMult := 0.15
+        minRoomR := 2.2
+        ftcWait := 8
+        cooldownBars := 3
+        minLegAtr := 2.6
+        bandAtr := 0.70
+        minStopPct := 0.45
+        widenStop := false
+        minVol := 0.0
+
+
+htfOf() =>
+    s = timeframe.in_seconds()
+    s <= 60 ? "5" : s <= 300 ? "15" : s <= 900 ? "60" : s <= 3600 ? "240" : s <= 14400 ? "D" : s <= 86400 ? "W" : "M"
+htf2Of() =>
+    s = timeframe.in_seconds()
+    s <= 60 ? "15" : s <= 300 ? "60" : s <= 900 ? "240" : s <= 3600 ? "D" : s <= 14400 ? "W" : "M"
+
+htf = htfOf()
+htf2 = htf2Of()
+
+catr = (ta.atr(5) * 1.0 + ta.atr(10) * 1.0 + ta.atr(21) * 2.0 + ta.atr(66) * 3.0 + ta.atr(132) * 5.0 + ta.atr(264) * 8.0) / 20.0
+
+ema21  = ta.ema(close, 21)
+ema84  = ta.ema(close, 84)
+ema200 = ta.ema(close, 200)
+rsi    = ta.rsi(close, 14)
+[pdi, mdi, adx] = ta.dmi(14, 14)
+
+htfClose = request.security(syminfo.tickerid, htf, close, barmerge.gaps_off, barmerge.lookahead_off)
+htfEma   = request.security(syminfo.tickerid, htf, ta.ema(close, 21), barmerge.gaps_off, barmerge.lookahead_off)
+htf2Close = request.security(syminfo.tickerid, htf2, close, barmerge.gaps_off, barmerge.lookahead_off)
+htf2Ema   = request.security(syminfo.tickerid, htf2, ta.ema(close, 21), barmerge.gaps_off, barmerge.lookahead_off)
+
+rng  = math.max(high - low, 1e-10)
+body = math.abs(close - open)
+br   = body / rng
+upSh = high - math.max(close, open)
+dnSh = math.min(close, open) - low
+
+cType() =>
+    float a = catr
+    float r = rng / a
+    r < 0.80 ? 0 : r <= 1.20 ? 1 : r <= 2.50 ? 2 : 3
+
+lastThird(bearish) =>
+    third = rng / 3.0
+    bearish ? (close <= low + third) : (close >= high - third)
+
+threeMasters(fromOff, toOff, wantHigh) =>
+    run = 0
+    lastExt = wantHigh ? -1e20 : 1e20
+    ok = false
+    for i = fromOff to toOff
+        m = cType()[i] == 1 and (br[i] >= 0.80 or math.max(high[i] - math.max(close[i], open[i]), math.min(close[i], open[i]) - low[i]) / math.max(high[i] - low[i], 1e-10) >= 0.80)
+        dirOk = wantHigh ? (close[i] > open[i]) : (close[i] < open[i])
+        if m and dirOk
+            ext = wantHigh ? high[i] : low[i]
+            if wantHigh
+                if ext > lastExt
+                    run += 1
+                    lastExt := ext
+                else
+                    run := 1
+                    lastExt := math.max(lastExt, ext)
+            else
+                if ext < lastExt
+                    run += 1
+                    lastExt := ext
+                else
+                    run := 1
+                    lastExt := math.min(lastExt, ext)
+            if run >= 3
+                ok := true
+        else
+            run := 0
+    ok
+
+originLowOff(eOff, look) =>
+    mn = low[eOff]
+    idx = eOff
+    for i = eOff to eOff + look
+        if low[i] < mn
+            mn := low[i]
+            idx := i
+    idx
+
+originHighOff(eOff, look) =>
+    mx = high[eOff]
+    idx = eOff
+    for i = eOff to eOff + look
+        if high[i] > mx
+            mx := high[i]
+            idx := i
+    idx
+
+moveOkUp(eOff) =>
+    orig = originLowOff(eOff, legLookback)
+    ((high[eOff] - low[orig]) >= minLegAtr * catr[eOff]) or threeMasters(orig, eOff, true)
+
+moveOkDn(eOff) =>
+    orig = originHighOff(eOff, legLookback)
+    ((high[orig] - low[eOff]) >= minLegAtr * catr[eOff]) or threeMasters(orig, eOff, false)
+
+coverHighAt(eOff) =>
+    bool ok = false
+    float extreme = high[eOff]
+    float inner = math.min(open[eOff], close[eOff])
+    rngE = math.max(high[eOff] - low[eOff], 1e-10)
+    bool master = (cType()[eOff] == 1) and (close[eOff] > open[eOff]) and ((math.abs(close[eOff] - open[eOff]) / rngE >= 0.80) or ((high[eOff] - math.max(close[eOff], open[eOff])) / rngE >= 0.80) or ((math.min(close[eOff], open[eOff]) - low[eOff]) / rngE >= 0.80))
+    bool longish = useLongbar and cType()[eOff] >= 2
+    float line = master ? low[eOff] : (longish ? high[eOff] - catr[eOff] : na)
+    if not na(line) and (master or longish) and moveOkUp(eOff)
+        if close < line and (not needThird or lastThird(true))
+            ok := true
+    [ok, extreme, inner]
+
+coverLowAt(eOff) =>
+    bool ok = false
+    float extreme = low[eOff]
+    float inner = math.max(open[eOff], close[eOff])
+    rngE = math.max(high[eOff] - low[eOff], 1e-10)
+    bool master = (cType()[eOff] == 1) and (close[eOff] < open[eOff]) and ((math.abs(close[eOff] - open[eOff]) / rngE >= 0.80) or ((high[eOff] - math.max(close[eOff], open[eOff])) / rngE >= 0.80) or ((math.min(close[eOff], open[eOff]) - low[eOff]) / rngE >= 0.80))
+    bool longish = useLongbar and cType()[eOff] >= 2
+    float line = master ? high[eOff] : (longish ? low[eOff] + catr[eOff] : na)
+    if not na(line) and (master or longish) and moveOkDn(eOff)
+        if close > line and (not needThird or lastThird(false))
+            ok := true
+    [ok, extreme, inner]
+
+[cH1, xH1, iH1] = coverHighAt(1)
+[cH2, xH2, iH2] = coverHighAt(2)
+[cL1, xL1, iL1] = coverLowAt(1)
+[cL2, xL2, iL2] = coverLowAt(2)
+
+newHighPivot = cH1 or (coverMax >= 2 and cH2 and not cH1)
+newLowPivot  = cL1 or (coverMax >= 2 and cL2 and not cL1)
+highExt = cH1 ? xH1 : xH2
+highIn  = cH1 ? iH1 : iH2
+lowExt  = cL1 ? xL1 : xL2
+lowIn   = cL1 ? iL1 : iL2
+highOff = cH1 ? 1 : 2
+lowOff  = cL1 ? 1 : 2
+
+if newHighPivot and newLowPivot
+    if (highExt - highIn) >= (lowIn - lowExt)
+        newLowPivot := false
+    else
+        newHighPivot := false
+
+var float[] resPx  = array.new_float()
+var float[] resAtr = array.new_float()
+var int[]   resBar = array.new_int()
+var float[] supPx  = array.new_float()
+var float[] supAtr = array.new_float()
+var int[]   supBar = array.new_int()
+
+isReversalHigh = false
+isReversalLow  = false
+int highMatches = 0
+int lowMatches = 0
+int highAge = 0
+int lowAge = 0
+
+lowestSince(len) =>
+    mn = low
+    for k = 0 to math.max(0, len)
+        mn := math.min(mn, low[k])
+    mn
+highestSince(len) =>
+    mx = high
+    for k = 0 to math.max(0, len)
+        mx := math.max(mx, high[k])
+    mx
+highestCloseSince(len) =>
+    mx = close
+    for k = 0 to math.max(0, len)
+        mx := math.max(mx, close[k])
+    mx
+lowestCloseSince(len) =>
+    mn = close
+    for k = 0 to math.max(0, len)
+        mn := math.min(mn, close[k])
+    mn
+
+if newHighPivot
+    n = array.size(resPx)
+    firstAway = 0.0
+    firstBroken = true
+    firstAge = 0
+    firstA = 0.0
+    got = false
+    if n > 0
+        for i = n - 1 to 0
+            px = array.get(resPx, i)
+            a  = array.get(resAtr, i)
+            b  = array.get(resBar, i)
+            band = bandAtr * math.max(catr, a)
+            age = bar_index - b
+            if math.abs(highExt - px) <= band and age >= 4
+                highMatches += 1
+                if not got
+                    look = math.min(300, age)
+                    firstAway := px - lowestSince(look)
+                    firstBroken := highestCloseSince(look) > px + 0.20 * a
+                    firstAge := age
+                    firstA := a
+                    got := true
+    if got and firstAway >= minAwayAtr * firstA and not firstBroken and highMatches >= minTests
+        isReversalHigh := true
+        highAge := firstAge
+    array.push(resPx, highExt)
+    array.push(resAtr, catr)
+    array.push(resBar, bar_index)
+    if array.size(resPx) > 40
+        array.shift(resPx)
+        array.shift(resAtr)
+        array.shift(resBar)
+
+if newLowPivot
+    n = array.size(supPx)
+    firstAway = 0.0
+    firstBroken = true
+    firstAge = 0
+    firstA = 0.0
+    got = false
+    if n > 0
+        for i = n - 1 to 0
+            px = array.get(supPx, i)
+            a  = array.get(supAtr, i)
+            b  = array.get(supBar, i)
+            band = bandAtr * math.max(catr, a)
+            age = bar_index - b
+            if math.abs(lowExt - px) <= band and age >= 4
+                lowMatches += 1
+                if not got
+                    look = math.min(300, age)
+                    firstAway := highestSince(look) - px
+                    firstBroken := lowestCloseSince(look) < px - 0.20 * a
+                    firstAge := age
+                    firstA := a
+                    got := true
+    if got and firstAway >= minAwayAtr * firstA and not firstBroken and lowMatches >= minTests
+        isReversalLow := true
+        lowAge := firstAge
+    array.push(supPx, lowExt)
+    array.push(supAtr, catr)
+    array.push(supBar, bar_index)
+    if array.size(supPx) > 40
+        array.shift(supPx)
+        array.shift(supAtr)
+        array.shift(supBar)
+
+roomR(dir, extreme, slDist) =>
+    float r = 99.0
+    if slDist <= 0
+        r := 0.0
+    else if dir == 1
+        best = 1e20
+        sz = array.size(resPx)
+        if sz > 0
+            for i = 0 to sz - 1
+                px = array.get(resPx, i)
+                if px > extreme and px < best
+                    best := px
+        if best < 1e20
+            r := (best - extreme) / slDist
+    else
+        best = -1e20
+        sz = array.size(supPx)
+        if sz > 0
+            for i = 0 to sz - 1
+                px = array.get(supPx, i)
+                if px < extreme and px > best
+                    best := px
+        if best > -1e20
+            r := (extreme - best) / slDist
+    r
+
+htfLongOk  = not useHtf or na(htfEma) or htfClose >= htfEma * 0.997
+htfShortOk = not useHtf or na(htfEma) or htfClose <= htfEma * 1.003
+htf2LongOk  = not useHtf2 or na(htf2Ema) or htf2Close >= htf2Ema
+htf2ShortOk = not useHtf2 or na(htf2Ema) or htf2Close <= htf2Ema
+
+var float armFtc  = na
+var float armSl   = na
+var int   armDir  = 0
+var int   armAge  = 0
+var int   armCover = 0
+var int   lastFill = -9999
+
+arm(dir, extreme, inner) =>
+    slBuf = slAtrMult * catr
+    sl = dir == 1 ? extreme - slBuf : extreme + slBuf
+    ftc = (extreme + inner) * 0.5
+    ftc := dir == 1 ? math.max(ftc, extreme + 0.20 * catr) : math.min(ftc, extreme - 0.20 * catr)
+    slDist = math.abs(ftc - sl)
+    minDist = ftc * minStopPct * 0.01
+    bool sizeOk = true
+    if slDist < minDist
+        if widenStop
+            slDist := minDist
+            sl := dir == 1 ? ftc - slDist : ftc + slDist
+        else
+            sizeOk := false
+    rm = roomR(dir, extreme, slDist)
+    ok = sizeOk and rm >= minRoomR and bar_index - lastFill >= cooldownBars
+    [ok, ftc, sl]
+
+if isReversalHigh and htfShortOk and htf2ShortOk
+    [ok, ftc, sl] = arm(-1, highExt, highIn)
+    if ok
+        armFtc := ftc
+        armSl  := sl
+        armDir := -1
+        armAge := 0
+        armCover := highOff
+
+if isReversalLow and htfLongOk and htf2LongOk
+    [ok, ftc, sl] = arm(1, lowExt, lowIn)
+    if ok
+        armFtc := ftc
+        armSl  := sl
+        armDir := 1
+        armAge := 0
+        armCover := lowOff
+
+apexLong  = false
+apexShort = false
+var float fillSl = na
+var float fillTp = na
+var float fillPx = na
+
+regimeLong  = not useEma84 or na(ema84) or close >= ema84
+regimeShort = not useEma84 or na(ema84) or close <= ema84
+stackUp   = not emaStack or (ema21 > ema84 and close > ema84 and close > ema200)
+stackDown = not emaStack or (ema21 < ema84 and close < ema84 and close < ema200)
+diLong    = not requireDI or pdi > mdi
+diShort   = not requireDI or mdi > pdi
+bodyOk    = br >= minBr
+coverOk   = not requireCover1 or armCover == 1
+volSma    = ta.sma(volume, 20)
+volOk     = minVol <= 0 or na(volSma) or volSma <= 0 or volume >= minVol * volSma
+
+if not na(armFtc)
+    armAge += 1
+    invalidated = armDir == 1 ? low <= armSl : high >= armSl
+    tagged      = armDir == 1 ? low <= armFtc : high >= armFtc
+    if invalidated
+        armFtc := na
+        armDir := 0
+    else if tagged
+        confL = not confirmCl or close > armFtc
+        confS = not confirmCl or close < armFtc
+        if armDir == 1 and confL and bodyOk and coverOk and volOk and regimeLong and stackUp and diLong and sides != "Short"
+            apexLong := true
+            fillPx := armFtc
+            fillSl := armSl
+            fillTp := armFtc + rr * math.abs(armFtc - armSl)
+        if armDir == -1 and confS and bodyOk and coverOk and volOk and regimeShort and stackDown and diShort and sides != "Long"
+            apexShort := true
+            fillPx := armFtc
+            fillSl := armSl
+            fillTp := armFtc - rr * math.abs(armFtc - armSl)
+        if apexLong or apexShort
+            lastFill := bar_index
+        armFtc := na
+        armDir := 0
+    else if armAge >= ftcWait
+        armFtc := na
+        armDir := 0
+
+plotshape(apexLong,  title = "APEX Long",  style = shape.triangleup,   location = location.belowbar, color = colLong,  size = size.small, text = "A")
+plotshape(apexShort, title = "APEX Short", style = shape.triangledown, location = location.abovebar, color = colShort, size = size.small, text = "A")
+plot(ema21,  "EMA21",  color = color.new(#9aa8b5, 62), linewidth = 1)
+plot(ema84,  "EMA84",  color = color.new(#eceae4, 72), linewidth = 1)
+plot(ema200, "EMA200", color = color.new(#8b9099, 78), linewidth = 1)
+
+var float lastEntry = na
+var float lastSl = na
+var float lastTp = na
+var int   lastDir = 0
+if apexLong
+    lastEntry := fillPx
+    lastSl := fillSl
+    lastTp := fillTp
+    lastDir := 1
+if apexShort
+    lastEntry := fillPx
+    lastSl := fillSl
+    lastTp := fillTp
+    lastDir := -1
+
+var line lnSl = na
+var line lnTp = na
+if showTg and not na(lastEntry) and barstate.islast
+    line.delete(lnSl)
+    line.delete(lnTp)
+    lnSl := line.new(bar_index - 8, lastSl, bar_index + 2, lastSl, color = color.new(colShort, 20), width = 1, style = line.style_dotted)
+    lnTp := line.new(bar_index - 8, lastTp, bar_index + 2, lastTp, color = color.new(colLong, 20), width = 1, style = line.style_dotted)
+
+alertcondition(apexLong,  title = "APEX Long",  message = "APEX LONG {ticker} {interval} @ {close}")
+alertcondition(apexShort, title = "APEX Short", message = "APEX SHORT {ticker} {interval} @ {close}")
+if apexLong
+    alert("APEX LONG " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+if apexShort
+    alert("APEX SHORT " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick), alert.freq_once_per_bar_close)
+
+biasTxt = (ema21 > ema84 and (not useHtf or htfClose > htfEma)) ? "LONG" : (ema21 < ema84 and (not useHtf or htfClose < htfEma)) ? "SHORT" : "FLAT"
+if showTbl
+    var table tb = table.new(position.top_right, 2, 7, bgcolor = color.new(#090a0c, 18), border_width = 0, frame_color = color.new(#9aa8b5, 72), frame_width = 1)
+    table.cell(tb, 0, 0, "APEX", text_color = color.new(#9aa8b5, 0), text_size = size.small, text_halign = text.align_left)
+    table.cell(tb, 1, 0, "1.5R", text_color = color.new(#eceae4, 0), text_size = size.small, text_halign = text.align_right)
+    table.cell(tb, 0, 1, "BIAS", text_color = color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, 1, biasTxt + " · " + htf, text_color = biasTxt == "LONG" ? color.new(colLong, 0) : biasTxt == "SHORT" ? color.new(colShort, 0) : color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(tb, 0, 2, "ATR", text_color = color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, 2, str.tostring(catr, format.mintick), text_color = color.new(#eceae4, 0), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(tb, 0, 3, "R:R", text_color = color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, 3, str.tostring(rr, "#.00"), text_color = color.new(#eceae4, 0), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(tb, 0, 4, "ADX", text_color = color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, 4, str.tostring(adx, "#.0"), text_color = color.new(#eceae4, 0), text_size = size.tiny, text_halign = text.align_right)
+    table.cell(tb, 0, 5, "FTC", text_color = color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_left)
+    armedTxt = na(armFtc) ? "—" : (armDir == 1 ? "LONG arm" : "SHORT arm")
+    table.cell(tb, 1, 5, armedTxt, text_color = armDir == 1 ? color.new(colLong, 0) : armDir == -1 ? color.new(colShort, 0) : color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_right)
+    lastTxt = lastDir == 1 ? "LONG" : lastDir == -1 ? "SHORT" : "—"
+    table.cell(tb, 0, 6, "LAST", text_color = color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_left)
+    table.cell(tb, 1, 6, lastTxt, text_color = lastDir == 1 ? color.new(colLong, 0) : lastDir == -1 ? color.new(colShort, 0) : color.new(#8b9099, 0), text_size = size.tiny, text_halign = text.align_right)
+
+plot(catr, "customATR", display = display.data_window)

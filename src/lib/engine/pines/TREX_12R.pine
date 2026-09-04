@@ -1,0 +1,329 @@
+//@version=5
+// TREX Entries Lab — 15m  |  TP 1.2R  |  BE @ 0.32R
+// Second-test live pivot → RTP into FTC. First-touch settlement is skipped.
+// Execution: skip if stop < 0.5% or target move < 0.5% of price.
+// After +0.32R, move stop to entry. Full take-profit at 1.2R.
+indicator("TREX Entries Lab", overlay = true, max_labels_count = 300, max_bars_back = 500, explicit_plot_zorder = true)
+
+legLookback   = input.int(40, "Leg lookback", minval = 10, maxval = 80, group = "Pivot")
+minLegAtr     = input.float(2.4, "Min leg × ATR", step = 0.1, group = "Pivot")
+coverMax      = input.int(2, "Max cover bars", minval = 1, maxval = 2, group = "Pivot")
+needThird     = input.bool(true, "Require last-third close", group = "Pivot")
+useLongbar    = input.bool(true, "Longbar / spike + hypothetical line", group = "Pivot")
+
+slAtrMult     = input.float(0.35, "Stop ATR (beyond extreme)", step = 0.05, group = "Execution")
+tpR           = input.float(1.2, "Target R-multiple", step = 0.1, group = "Execution")
+beAtR         = input.float(0.32, "Move stop to BE at R", step = 0.05, group = "Execution")
+ftcWait       = input.int(12, "FTC wait (bars)", minval = 3, maxval = 30, group = "Execution")
+minRoomR      = input.float(1.5, "Min room to next opposite pivot (R)", step = 0.1, group = "Execution")
+minStopPct    = input.float(0.5, "Min stop % of price", step = 0.02, group = "Execution")
+minTpPct      = input.float(0.5, "Min target move % of price", step = 0.02, group = "Execution")
+useHtfEma     = input.bool(true, "HTF EMA50 alignment", group = "Filters")
+cooldownBars  = input.int(3, "Cooldown after fill", minval = 0, group = "Filters")
+
+colLong       = input.color(#3f8f74, "Long", group = "Style")
+colShort      = input.color(#b85c4c, "Short", group = "Style")
+
+catr = (ta.atr(5) * 1.0 + ta.atr(10) * 1.0 + ta.atr(21) * 2.0 + ta.atr(66) * 3.0 + ta.atr(132) * 5.0 + ta.atr(264) * 8.0) / 20.0
+
+rng  = math.max(high - low, 1e-10)
+body = math.abs(close - open)
+upSh = high - math.max(close, open)
+dnSh = math.min(close, open) - low
+br   = body / rng
+mainSh = math.max(upSh, dnSh)
+
+cType() =>
+    float a = catr
+    float r = rng / a
+    r < 0.80 ? 0 : r <= 1.20 ? 1 : r <= 2.50 ? 2 : 3
+
+lastThird(bearish) =>
+    third = rng / 3.0
+    bearish ? (close <= low + third) : (close >= high - third)
+
+threeMasters(fromOff, toOff, wantHigh) =>
+    run = 0
+    lastExt = wantHigh ? -1e20 : 1e20
+    ok = false
+    for i = fromOff to toOff
+        m = cType()[i] == 1 and (br[i] >= 0.80 or math.max(high[i] - math.max(close[i], open[i]), math.min(close[i], open[i]) - low[i]) / math.max(high[i] - low[i], 1e-10) >= 0.80)
+        dirOk = wantHigh ? (close[i] > open[i]) : (close[i] < open[i])
+        if m and dirOk
+            ext = wantHigh ? high[i] : low[i]
+            if wantHigh
+                if ext > lastExt
+                    run += 1
+                    lastExt := ext
+                else
+                    run := 1
+                    lastExt := math.max(lastExt, ext)
+            else
+                if ext < lastExt
+                    run += 1
+                    lastExt := ext
+                else
+                    run := 1
+                    lastExt := math.min(lastExt, ext)
+            if run >= 3
+                ok := true
+        else
+            run := 0
+    ok
+
+originLowOff(eOff, look) =>
+    mn = low[eOff]
+    idx = eOff
+    for i = eOff to eOff + look
+        if low[i] < mn
+            mn := low[i]
+            idx := i
+    idx
+
+originHighOff(eOff, look) =>
+    mx = high[eOff]
+    idx = eOff
+    for i = eOff to eOff + look
+        if high[i] > mx
+            mx := high[i]
+            idx := i
+    idx
+
+moveOkUp(eOff) =>
+    orig = originLowOff(eOff, legLookback)
+    threeMasters(orig, eOff, true) or ((high[eOff] - low[orig]) >= minLegAtr * catr[eOff])
+
+moveOkDn(eOff) =>
+    orig = originHighOff(eOff, legLookback)
+    threeMasters(orig, eOff, false) or ((high[orig] - low[eOff]) >= minLegAtr * catr[eOff])
+
+coverHighAt(eOff) =>
+    bool ok = false
+    float extreme = high[eOff]
+    float inner = math.min(open[eOff], close[eOff])
+    rngE = math.max(high[eOff] - low[eOff], 1e-10)
+    bool master = (cType()[eOff] == 1) and (close[eOff] > open[eOff]) and ((math.abs(close[eOff] - open[eOff]) / rngE >= 0.80) or ((high[eOff] - math.max(close[eOff], open[eOff])) / rngE >= 0.80) or ((math.min(close[eOff], open[eOff]) - low[eOff]) / rngE >= 0.80))
+    bool longish = useLongbar and cType()[eOff] >= 2
+    float line = master ? low[eOff] : (longish ? high[eOff] - catr[eOff] : na)
+    if not na(line) and (master or longish) and moveOkUp(eOff)
+        if close < line and (not needThird or lastThird(true))
+            ok := true
+    [ok, extreme, inner]
+
+coverLowAt(eOff) =>
+    bool ok = false
+    float extreme = low[eOff]
+    float inner = math.max(open[eOff], close[eOff])
+    rngE = math.max(high[eOff] - low[eOff], 1e-10)
+    bool master = (cType()[eOff] == 1) and (close[eOff] < open[eOff]) and ((math.abs(close[eOff] - open[eOff]) / rngE >= 0.80) or ((high[eOff] - math.max(close[eOff], open[eOff])) / rngE >= 0.80) or ((math.min(close[eOff], open[eOff]) - low[eOff]) / rngE >= 0.80))
+    bool longish = useLongbar and cType()[eOff] >= 2
+    float line = master ? high[eOff] : (longish ? low[eOff] + catr[eOff] : na)
+    if not na(line) and (master or longish) and moveOkDn(eOff)
+        if close > line and (not needThird or lastThird(false))
+            ok := true
+    [ok, extreme, inner]
+
+[cH1, xH1, iH1] = coverHighAt(1)
+[cH2, xH2, iH2] = coverHighAt(2)
+[cL1, xL1, iL1] = coverLowAt(1)
+[cL2, xL2, iL2] = coverLowAt(2)
+
+newHighPivot = cH1 or (coverMax >= 2 and cH2 and not cH1)
+newLowPivot  = cL1 or (coverMax >= 2 and cL2 and not cL1)
+highExt = cH1 ? xH1 : xH2
+highIn  = cH1 ? iH1 : iH2
+lowExt  = cL1 ? xL1 : xL2
+lowIn   = cL1 ? iL1 : iL2
+
+if newHighPivot and newLowPivot
+    if (highExt - highIn) >= (lowIn - lowExt)
+        newLowPivot := false
+    else
+        newHighPivot := false
+
+var float[] resPx  = array.new_float()
+var float[] resAtr = array.new_float()
+var int[]   resBar = array.new_int()
+var float[] supPx  = array.new_float()
+var float[] supAtr = array.new_float()
+var int[]   supBar = array.new_int()
+
+isReversalHigh = false
+isReversalLow  = false
+
+lowestSince(len) =>
+    mn = low
+    for k = 0 to math.max(0, len)
+        mn := math.min(mn, low[k])
+    mn
+
+highestSince(len) =>
+    mx = high
+    for k = 0 to math.max(0, len)
+        mx := math.max(mx, high[k])
+    mx
+
+highestCloseSince(len) =>
+    mx = close
+    for k = 0 to math.max(0, len)
+        mx := math.max(mx, close[k])
+    mx
+
+lowestCloseSince(len) =>
+    mn = close
+    for k = 0 to math.max(0, len)
+        mn := math.min(mn, close[k])
+    mn
+
+if newHighPivot
+    n = array.size(resPx)
+    if n > 0
+        for i = n - 1 to 0
+            px = array.get(resPx, i)
+            a  = array.get(resAtr, i)
+            b  = array.get(resBar, i)
+            band = 0.70 * math.max(catr, a)
+            if math.abs(highExt - px) <= band and bar_index - b >= 4
+                look = math.min(300, bar_index - b)
+                away = px - lowestSince(look)
+                broken = highestCloseSince(look) > px + 0.20 * a
+                if away >= 1.0 * a and not broken
+                    isReversalHigh := true
+                break
+    array.push(resPx, highExt)
+    array.push(resAtr, catr)
+    array.push(resBar, bar_index)
+    if array.size(resPx) > 40
+        array.shift(resPx)
+        array.shift(resAtr)
+        array.shift(resBar)
+
+if newLowPivot
+    n = array.size(supPx)
+    if n > 0
+        for i = n - 1 to 0
+            px = array.get(supPx, i)
+            a  = array.get(supAtr, i)
+            b  = array.get(supBar, i)
+            band = 0.70 * math.max(catr, a)
+            if math.abs(lowExt - px) <= band and bar_index - b >= 4
+                look = math.min(300, bar_index - b)
+                away = highestSince(look) - px
+                broken = lowestCloseSince(look) < px - 0.20 * a
+                if away >= 1.0 * a and not broken
+                    isReversalLow := true
+                break
+    array.push(supPx, lowExt)
+    array.push(supAtr, catr)
+    array.push(supBar, bar_index)
+    if array.size(supPx) > 40
+        array.shift(supPx)
+        array.shift(supAtr)
+        array.shift(supBar)
+
+roomR(dir, extreme, slDist) =>
+    float r = 99.0
+    if slDist <= 0
+        r := 0.0
+    else if dir == 1
+        best = 1e20
+        sz = array.size(resPx)
+        if sz > 0
+            for i = 0 to sz - 1
+                px = array.get(resPx, i)
+                if px > extreme and px < best
+                    best := px
+        if best < 1e20
+            r := (best - extreme) / slDist
+    else
+        best = -1e20
+        sz = array.size(supPx)
+        if sz > 0
+            for i = 0 to sz - 1
+                px = array.get(supPx, i)
+                if px < extreme and px > best
+                    best := px
+        if best > -1e20
+            r := (extreme - best) / slDist
+    r
+
+htfOf() =>
+    p = timeframe.period
+    p == "1" or p == "3" ? "5" : p == "5" ? "15" : p == "15" or p == "30" ? "60" : p == "60" or p == "120" ? "240" : p == "240" or p == "180" or p == "360" ? "D" : p == "D" ? "W" : p == "W" ? "M" : "D"
+
+htfEma   = request.security(syminfo.tickerid, htfOf(), ta.ema(close, 50), barmerge.gaps_off, barmerge.lookahead_off)
+htfClose = request.security(syminfo.tickerid, htfOf(), close,             barmerge.gaps_off, barmerge.lookahead_off)
+
+htfLongOk  = not useHtfEma or na(htfEma) or htfClose >= htfEma * 0.997
+htfShortOk = not useHtfEma or na(htfEma) or htfClose <= htfEma * 1.003
+
+var float armFtc  = na
+var float armSl   = na
+var float armTp   = na
+var int   armDir  = 0
+var int   armAge  = 0
+var int   lastFill = -9999
+
+arm(dir, extreme, inner) =>
+    slBuf = slAtrMult * catr
+    sl = dir == 1 ? extreme - slBuf : extreme + slBuf
+    ftc = (extreme + inner) * 0.5
+    ftc := dir == 1 ? math.max(ftc, extreme + 0.20 * catr) : math.min(ftc, extreme - 0.20 * catr)
+    slDist = math.abs(ftc - sl)
+    rm = roomR(dir, extreme, slDist)
+    stopPctNow = slDist / math.max(ftc, 1e-10) * 100.0
+    tpPctNow = slDist * tpR / math.max(ftc, 1e-10) * 100.0
+    ok = rm >= minRoomR and bar_index - lastFill >= cooldownBars and stopPctNow >= minStopPct and tpPctNow >= minTpPct
+    tp = dir == 1 ? ftc + tpR * slDist : ftc - tpR * slDist
+    [ok, ftc, sl, tp]
+
+if isReversalHigh and htfShortOk
+    [ok, ftc, sl, tp] = arm(-1, highExt, highIn)
+    if ok
+        armFtc := ftc
+        armSl  := sl
+        armTp  := tp
+        armDir := -1
+        armAge := 0
+
+if isReversalLow and htfLongOk
+    [ok, ftc, sl, tp] = arm(1, lowExt, lowIn)
+    if ok
+        armFtc := ftc
+        armSl  := sl
+        armTp  := tp
+        armDir := 1
+        armAge := 0
+
+longFill  = false
+shortFill = false
+
+if not na(armFtc)
+    armAge += 1
+    invalidated = armDir == 1 ? low <= armSl : high >= armSl
+    tagged      = armDir == 1 ? low <= armFtc : high >= armFtc
+    if invalidated
+        armFtc := na
+        armDir := 0
+    else if tagged
+        longFill  := armDir == 1
+        shortFill := armDir == -1
+        lastFill  := bar_index
+        txt = (armDir == 1 ? "L " : "S ") + str.tostring(tpR, "#.0") + "R  BE@" + str.tostring(beAtR, "#.00") + "R"
+        label.new(bar_index, armDir == 1 ? low : high, txt, style = armDir == 1 ? label.style_label_up : label.style_label_down, color = color.new(armDir == 1 ? colLong : colShort, 20), textcolor = color.white, size = size.tiny)
+        armFtc := na
+        armDir := 0
+    else if armAge >= ftcWait
+        armFtc := na
+        armDir := 0
+
+plotshape(longFill,  title = "Long",  style = shape.triangleup,   location = location.belowbar, color = colLong,  size = size.small, text = "L")
+plotshape(shortFill, title = "Short", style = shape.triangledown, location = location.abovebar, color = colShort, size = size.small, text = "S")
+
+alertcondition(longFill,  title = "TREX Long",  message = 'TREX long — TP {{plot("TP")}} SL {{plot("SL")}}')
+alertcondition(shortFill, title = "TREX Short", message = 'TREX short — TP {{plot("TP")}} SL {{plot("SL")}}')
+
+plot(armFtc, "FTC", color = color.new(colLong, 30), style = plot.style_linebr)
+plot(armSl,  "SL",  color = color.new(colShort, 30), style = plot.style_linebr)
+plot(armTp,  "TP",  color = color.new(#6d9a84, 50), style = plot.style_linebr)
+plot(catr, "customATR", display = display.data_window)
