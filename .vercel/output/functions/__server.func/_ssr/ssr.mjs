@@ -137,7 +137,7 @@ var HEADERS = { TSS_SHELL: "X-TSS_SHELL" };
 * the dev styles URL for route-scoped CSS collection.
 */
 async function getStartManifest(matchedRoutes) {
-	const { tsrStartManifest } = await import("../_tanstack-start-manifest_v-DUqBjOZ6.mjs");
+	const { tsrStartManifest } = await import("../_tanstack-start-manifest_v-DHOFTbCN.mjs");
 	const startManifest = tsrStartManifest();
 	let routes = startManifest.routes;
 	routes[rootRouteId];
@@ -159,59 +159,59 @@ async function getStartManifest(matchedRoutes) {
 var manifest = {
 	"039a33f78b54a4e0fe216da10bd78d42b890855ffa1d309924201c4e1e38eb4c": {
 		functionName: "lockDesk_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"061db685f597ff62666a2887a7d68770b8b5e9347ce55392b65f40c657bc82dc": {
 		functionName: "setDeskPin_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"1dca5db0c82c3146dccc37079c7ad7d8709ff1adbe2eb39ca35642c269339bc9": {
 		functionName: "testVenue_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"3124d2a14923c3fc91fb737ba65b53272e32bef10386e3be82aff6291b529724": {
 		functionName: "unlockDesk_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"349887dd1cb30ec49d5e681b53524567fa27c97168784d805b6a312a6d6df3a7": {
 		functionName: "rotateDeskToken_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"8f2a7724fceb919e594568ba458121728961f22bca8ecebd16303fe952fc9562": {
 		functionName: "saveDeskTradeNote_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"8fa4ac9d596e86c3956fa0b32e871edea57a88551fb37623af946f8063c3e66c": {
 		functionName: "saveDeskSettings_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"92cc74e30111f606f86082685f11b450907ddf635cb21368bf245c650cae5724": {
 		functionName: "probeBtc_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"9611d6bbd7d61b428c99ac1e5f3012d02505e8e391e598110a5d497a4c5dd202": {
 		functionName: "getJournal_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"b5825ea3b020991663a72ea863a5d7e43c4690d8e946381fde90d4b88a17bdbe": {
 		functionName: "tickNow_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"bf39c38732e04027142d94e8edbfaaccfde7365c8ba31d1b1bb802f292510f41": {
 		functionName: "getDesk_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"c67d6055fb31e9e10cc3c1ce07bf4c3c5b153917304b79dedb10877fc7ef4313": {
 		functionName: "seedDeskJournal_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"e43fde0818d40d516c5a977d5c9a045f0d5ea5b0fb1e3cab7fa1804894dee2a3": {
 		functionName: "resetDeskJournal_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	},
 	"fe674c6991390d75beec27fff34c9e508559466c404d1939170dd079e77852fb": {
 		functionName: "refreshCoins_createServerFn_handler",
-		importer: () => import("./functions-RKjAp-Uo.mjs")
+		importer: () => import("./functions-Jm_aTXFA.mjs")
 	}
 };
 async function getServerFnById(id, access) {
@@ -1481,7 +1481,7 @@ var getBaseManifest = getProdBaseManifest;
 var createEarlyHintsForRequest = createEarlyHintsCollector;
 async function loadEntries() {
 	const [routerEntry, startEntry, pluginAdapters] = await Promise.all([
-		import("./router-CyiDPfjt.mjs").then((n) => n.t),
+		import("./router-kf2Pjw6r.mjs").then((n) => n.t),
 		import("./start-5Z2QO8AU.mjs"),
 		import("./empty-plugin-adapters-D9UWiqvJ.mjs")
 	]);
