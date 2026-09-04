@@ -371,28 +371,10 @@ export const hyperliquidAdapter: ExchangeAdapter = {
         };
       }
 
-      let hasPos = entryLive(grouped);
-      if (!hasPos) {
-        try {
-          hasPos = (await coinPositionSize(account, hit.coin)) > 0;
-        } catch {
-          hasPos = false;
-        }
-      }
-
-      if (hasPos) {
-        return await protectOrFlatten(
-          grouped,
-          allOrderErrors(grouped) || "Hyperliquid entry filled but SL/TP did not confirm",
-        );
-      }
-
-      const solo = await place({ orders: [entry], grouping: "na" });
-      const soloErr = allOrderErrors(solo);
-      if (soloErr || !entryLive(solo)) {
-        return { ok: false, message: soloErr || "Hyperliquid IOC did not fill" };
-      }
-      return await protectOrFlatten(solo, allOrderErrors(solo) || "Hyperliquid SL/TP rejected after fill");
+      return await protectOrFlatten(
+        grouped,
+        allOrderErrors(grouped) || "Hyperliquid entry unconfirmed — not sending a second fill",
+      );
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Hyperliquid order failed" };
     }

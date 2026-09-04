@@ -433,6 +433,32 @@ export const lighterAdapter: ExchangeAdapter = {
         if (err) throw new Error(err);
         return h;
       });
+      let left: { qty: number } | undefined;
+      let readFailed = false;
+      for (let i = 0; i < 3; i++) {
+        try {
+          left = (await this.fetchPositions(account)).find((p) => coinOf(p.symbol) === mkt.coin);
+          readFailed = false;
+          if (!left?.qty) break;
+        } catch {
+          readFailed = true;
+        }
+        if (i < 2) await new Promise((r) => setTimeout(r, 400));
+      }
+      if (readFailed) {
+        return {
+          ok: false,
+          orderId: hash,
+          message: "Lighter close unconfirmed — SL/TP left in place",
+        };
+      }
+      if (left?.qty) {
+        return {
+          ok: false,
+          orderId: hash,
+          message: "Lighter close left a remainder — SL/TP left in place",
+        };
+      }
       return { ok: true, orderId: hash, message: "closed" };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "close failed" };

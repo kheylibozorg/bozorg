@@ -88,13 +88,49 @@ function isStopType(type: string, origType: string) {
   return typ.includes("STOP");
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function asterPositionAmt(account: ExchangeAccount, symbol: string): Promise<number | null> {
+  try {
+    const pos = (await signed(account, "GET", "/fapi/v2/positionRisk", { symbol })) as Array<{
+      positionAmt: string;
+    }>;
+    return Number(pos[0]?.positionAmt ?? 0);
+  } catch {
+    return null;
+  }
+}
+
+/** Wait until a fill shows up (or give up). 0 = confirmed flat, null = read failed. */
+async function waitAsterAmt(account: ExchangeAccount, symbol: string): Promise<number | null> {
+  let last: number | null = null;
+  for (let i = 0; i < 3; i++) {
+    last = await asterPositionAmt(account, symbol);
+    if (last != null && last !== 0) return last;
+    if (i < 2) await sleep(300);
+  }
+  return last;
+}
+
+/** Wait until the position is gone after a close. */
+async function waitAsterFlat(account: ExchangeAccount, symbol: string): Promise<"flat" | "open" | "unknown"> {
+  let last: number | null = null;
+  for (let i = 0; i < 3; i++) {
+    last = await asterPositionAmt(account, symbol);
+    if (last === 0) return "flat";
+    if (i < 2) await sleep(300);
+  }
+  if (last == null) return "unknown";
+  return last === 0 ? "flat" : "open";
+}
+
 async function asterMarketClose(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   const specs = await loadSpecs();
   const spec = specs.find((s) => s.symbol === symbol);
-  const pos = (await signed(account, "GET", "/fapi/v2/positionRisk", { symbol })) as Array<{
-    positionAmt: string;
-  }>;
-  const amt = Number(pos[0]?.positionAmt ?? 0);
+  const amt = await asterPositionAmt(account, symbol);
+  if (amt == null) return { ok: false, message: "Aster position read failed before close" };
   if (!amt) return { ok: true, message: "flat" };
   const qty = spec ? roundToStep(Math.abs(amt), spec.stepSize, spec.minQty) : Math.abs(amt);
   if (!qty) return { ok: false, message: `Aster close size below min for ${symbol}` };
@@ -117,19 +153,23 @@ async function asterCancelOpen(account: ExchangeAccount, symbol: string) {
   }
 }
 
-/** Close first. Only cancel leftover SL/TP after the position is actually flat. */
+/** Close first. Never cancel SL/TP unless the position is confirmed flat. */
 async function closeAndDisarm(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   const closed = await asterMarketClose(account, symbol);
   if (!closed.ok && closed.message !== "flat") return closed;
-  try {
-    const pos = (await signed(account, "GET", "/fapi/v2/positionRisk", { symbol })) as Array<{
-      positionAmt: string;
-    }>;
-    if (Number(pos[0]?.positionAmt ?? 0) !== 0) {
-      return { ok: false, message: "Aster close left a remainder" };
-    }
-  } catch {
-    /* still cancel leftovers if the read fails after a reported close */
+  if (closed.message === "flat") {
+    await asterCancelOpen(account, symbol);
+    return closed;
+  }
+  const state = await waitAsterFlat(account, symbol);
+  if (state !== "flat") {
+    return {
+      ok: false,
+      message:
+        state === "unknown"
+          ? "Aster close unconfirmed — SL/TP left in place"
+          : "Aster close left a remainder — SL/TP left in place",
+    };
   }
   await asterCancelOpen(account, symbol);
   return closed;
@@ -241,13 +281,32 @@ export const asterAdapter: ExchangeAdapter = {
       }
       const side = order.side === "long" ? "BUY" : "SELL";
       const closeSide = side === "BUY" ? "SELL" : "BUY";
-      const data = (await signed(account, "POST", "/fapi/v1/order", {
-        symbol: order.symbol,
-        side,
-        type: "MARKET",
-        quantity: qty,
-        newOrderRespType: "RESULT",
-      })) as { orderId?: number };
+      let data: { orderId?: number } = {};
+      try {
+        data = (await signed(account, "POST", "/fapi/v1/order", {
+          symbol: order.symbol,
+          side,
+          type: "MARKET",
+          quantity: qty,
+          newOrderRespType: "RESULT",
+        })) as { orderId?: number };
+      } catch (err) {
+        const why = err instanceof Error ? err.message : "Aster order failed";
+        const amt = await waitAsterAmt(account, order.symbol);
+        if (amt === 0) return { ok: false, message: why };
+        if (amt == null) {
+          try {
+            const closed = await closeAndDisarm(account, order.symbol);
+            return flattenMessage(closed, `Aster entry unconfirmed (${why})`);
+          } catch (e) {
+            return {
+              ok: false,
+              liveOpen: true,
+              message: `Aster entry unconfirmed (${why}) — flatten failed (${e instanceof Error ? e.message : "close threw"})`,
+            };
+          }
+        }
+      }
 
       let slErr = "";
       let tpErr = "";
