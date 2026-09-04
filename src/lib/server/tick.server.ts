@@ -14,7 +14,7 @@ import {
   scanLastN,
   type TfCursor,
 } from "@/lib/engine/scan-schedule";
-import { bookVenue, chartHostLabel, coinOf, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
+import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
 import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
 import { capLeverage } from "@/lib/exchanges/lev-cap";
 import type { ExchangeAccount } from "@/lib/exchanges/types";
@@ -106,12 +106,6 @@ const ORPHAN_MARK = "UNPROTECTED flatten failed";
 
 function isOrphanPosition(pos: { signal_reason?: string | null }) {
   return typeof pos.signal_reason === "string" && pos.signal_reason.includes(ORPHAN_MARK);
-}
-
-function deskSymbolOf(raw: string, universe: Array<{ symbol: string }>) {
-  const coin = coinOf(raw);
-  const hit = universe.find((a) => coinOf(a.symbol) === coin);
-  return hit?.symbol ?? `${coin}USDT`;
 }
 
 async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -372,6 +366,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   }
 
   for (const pos of open) {
+    if (pos.mode === "live") {
+      if (!live || !adapter) continue;
+      if (pos.venue && pos.venue !== "paper" && bookVenue(pos.venue) !== venue) continue;
+    }
     if (live && adapter && pos.mode === "live" && isOrphanPosition(pos)) {
       try {
         const res = await adapter.closePosition(acc, venueSymbol(venue, pos.symbol));
@@ -529,12 +527,15 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     }
   }
 
+  let venueBook: Array<{ symbol: string; side: "long" | "short"; qty: number }> | null = null;
   if (live && adapter) {
     try {
       const exPos = await adapter.fetchPositions(acc);
+      venueBook = exPos;
       const still = await listOpenPositions();
       for (const pos of still) {
         if (pos.mode !== "live") continue;
+        if (pos.venue && pos.venue !== "paper" && bookVenue(pos.venue) !== venue) continue;
         const age = Date.now() - new Date(pos.opened_at).getTime();
         if (age < 45_000) continue;
         const onEx = exPos.some((p) => sameCoin(p.symbol, pos.symbol) || sameCoin(p.symbol, venueSymbol(venue, pos.symbol)));
@@ -566,72 +567,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         await bumpEquity(pnl);
         closed += 1;
       }
-      const stillAfter = await listOpenPositions();
-      for (const ex of exPos) {
-        const tracked = stillAfter.some(
-          (p) =>
-            p.mode === "live" &&
-            (sameCoin(p.symbol, ex.symbol) || sameCoin(venueSymbol(venue, p.symbol), ex.symbol)),
-        );
-        if (tracked) continue;
-        const sym = deskSymbolOf(ex.symbol, universe);
-        let flat = false;
-        try {
-          const res = await adapter.closePosition(acc, ex.symbol);
-          flat = res.ok || res.message === "flat";
-        } catch {
-          flat = false;
-        }
-        if (flat) {
-          await dropOrphanFill(sym).catch(() => undefined);
-          continue;
-        }
-        try {
-          const id = await insertPosition({
-            mode: "live",
-            venue,
-            symbol: sym,
-            timeframe: "5m",
-            indicator: "ORPHAN",
-            side: ex.side,
-            entry: ex.entry || 0,
-            sl: ex.entry || 0,
-            tp: ex.entry || 0,
-            qty: ex.qty,
-            leverage: ex.leverage || 1,
-            notional: Math.abs((ex.entry || 0) * ex.qty),
-            risk: 0,
-            fees: 0,
-            signalReason: ORPHAN_MARK,
-            margin: Math.abs((ex.entry || 0) * ex.qty) / Math.max(1, ex.leverage || 1),
-          });
-          if (id) continue;
-        } catch {
-          /* persist JSON next */
-        }
-        try {
-          await rememberOrphanFill({
-            venue,
-            symbol: sym,
-            side: ex.side,
-            qty: ex.qty,
-            entry: ex.entry || 0,
-            sl: ex.entry || 0,
-            tp: ex.entry || 0,
-            leverage: ex.leverage || 1,
-            notional: Math.abs((ex.entry || 0) * ex.qty),
-            risk: 0,
-            fees: 0,
-            timeframe: "5m",
-            indicator: "ORPHAN",
-            reason: ORPHAN_MARK,
-          });
-        } catch {
-          /* next fetchPositions retries */
-        }
-      }
     } catch {
-      /* venue read failed — keep desk rows */
+      /* venue read failed — keep desk rows, do not treat as all-flat */
     }
   }
 
@@ -843,6 +780,12 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     const stale = opts.source !== "manual" && !isFreshSignal(s.barTime, s.timeframe, Date.now());
     if (stale) skip = "stale bar";
     else if (held.has(s.symbol)) skip = "already in symbol";
+    else if (
+      live &&
+      venueBook &&
+      venueBook.some((p) => sameCoin(p.symbol, s.symbol) || sameCoin(p.symbol, venueSymbol(venue, s.symbol)))
+    )
+      skip = "already on venue";
     else if (used >= remainingSlots) skip = "max positions";
     else if (
       await alreadyFilled({

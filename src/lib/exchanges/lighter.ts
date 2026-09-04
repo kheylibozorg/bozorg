@@ -410,7 +410,7 @@ export const lighterAdapter: ExchangeAdapter = {
     try {
       const markets = await fetchLighterMarkets();
       const mkt = marketOf(markets, symbol);
-      if (!mkt) return { ok: true, message: "no market" };
+      if (!mkt) return { ok: false, message: "no market" };
       const pos = (await this.fetchPositions(account)).find((p) => coinOf(p.symbol) === mkt.coin);
       if (!pos || !pos.qty) return { ok: true, message: "flat" };
       const qty = scale(pos.qty, mkt.sizeDecimals);
@@ -440,7 +440,7 @@ export const lighterAdapter: ExchangeAdapter = {
   },
   async fetchPositions(account) {
     const json = await accountQuery(account);
-    if (!json) return [];
+    if (!json) throw new Error("Lighter account query failed");
     const pos = json.accounts?.[0]?.positions ?? [];
     return pos
       .filter((p) => Number(p.position) !== 0)

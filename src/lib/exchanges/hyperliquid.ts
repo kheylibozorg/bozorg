@@ -152,7 +152,7 @@ async function marketCloseHl(account: ExchangeAccount, symbol: string): Promise<
   if (!user) return { ok: false, message: "Hyperliquid address missing" };
   const { meta, mids } = await loadMeta();
   const hit = assetOf(meta, symbol);
-  if (!hit) return { ok: true, message: "no market" };
+  if (!hit) return { ok: false, message: "no market" };
   const state = await info<{
     assetPositions?: Array<{ position?: { coin: string; szi: string } }>;
   }>({ type: "clearinghouseState", user });
@@ -500,7 +500,7 @@ export const hyperliquidAdapter: ExchangeAdapter = {
   },
   async fetchPositions(account) {
     const user = masterAddress(account);
-    if (!user) return [];
+    if (!user) throw new Error("Hyperliquid address missing");
     const state = await info<{
       assetPositions?: Array<{
         position?: {

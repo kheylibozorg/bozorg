@@ -400,7 +400,7 @@ export const toobitAdapter: ExchangeAdapter = {
     }
   },
   async fetchPositions(account) {
-    if (!account.apiKey || !account.apiSecret) return [];
+    if (!account.apiKey || !account.apiSecret) throw new Error("Toobit API key missing");
     const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {})) as Array<{
       symbol: string;
       position: string;
