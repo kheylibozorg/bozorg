@@ -25,6 +25,7 @@ function Page() {
   const [mode, setMode] = useState(s.mode);
   const [venue, setVenue] = useState(s.venue);
   const [capital, setCapital] = useState(String(s.capitalPct ?? 10));
+  const [maxLev, setMaxLev] = useState(String(s.maxLeverage ?? 200));
   const [maxPos, setMaxPos] = useState(String(s.maxPositions));
   const [equity, setEquity] = useState(String(s.equityUsd));
   const [batch, setBatch] = useState(String(s.scanBatch ?? 0));
@@ -52,6 +53,7 @@ function Page() {
     setMode(s.mode);
     setVenue(s.venue);
     setCapital(String(s.capitalPct ?? 10));
+    setMaxLev(String(s.maxLeverage ?? 200));
     setMaxPos(String(s.maxPositions ?? 4));
     setEquity(String(s.equityUsd));
     setBatch(String(s.scanBatch ?? 0));
@@ -62,6 +64,7 @@ function Page() {
     s.mode,
     s.venue,
     s.capitalPct,
+    s.maxLeverage,
     s.maxPositions,
     s.equityUsd,
     s.scanBatch,
@@ -80,6 +83,7 @@ function Page() {
           mode,
           venue: venue as VenueId,
           capital_pct: Math.min(100, Math.max(1, Number(capital) || 10)),
+          max_leverage: Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200))),
           max_positions: Math.min(20, Math.max(1, Math.round(Number(maxPos) || 4))),
           equity_usd: Number(equity),
           scan_batch: Math.min(250, Math.max(0, Math.round(Number(batch) || 0))),
@@ -99,6 +103,7 @@ function Page() {
         },
       });
       setCapital(String(saved.capitalPct ?? capital));
+      setMaxLev(String(saved.maxLeverage ?? maxLev));
       setMaxPos(String(saved.maxPositions ?? maxPos));
       setBatch(String(saved.scanBatch ?? batch));
       setMinCap(String(usdToMillions(saved.minMarketCapUsd)));
@@ -277,6 +282,36 @@ function Page() {
             disabled={!unlocked}
             onChange={(e) => setCapital(e.target.value)}
           />
+        </div>
+        <div className="grid gap-1.5">
+          <Label htmlFor="venue-maxlev">{t.autoLev}</Label>
+          <Input
+            id="venue-maxlev"
+            type="number"
+            min={1}
+            max={200}
+            step={1}
+            value={maxLev}
+            disabled={!unlocked}
+            onChange={(e) => setMaxLev(e.target.value)}
+          />
+          <div className="flex flex-wrap gap-1">
+            {[5, 10, 20, 25, 50, 100, 200].map((n) => (
+              <button
+                key={n}
+                type="button"
+                disabled={!unlocked}
+                onClick={() => setMaxLev(String(n))}
+                className={`min-h-8 rounded-sm border px-2 text-xs ${
+                  Number(maxLev) === n
+                    ? "border-accent bg-surface-2 text-fg"
+                    : "border-border text-muted hover:border-border-strong"
+                } disabled:opacity-40`}
+              >
+                {n}x
+              </button>
+            ))}
+          </div>
         </div>
         <div className="grid gap-1.5">
           <Label>{t.maxPos}</Label>
@@ -458,8 +493,8 @@ function Page() {
       </div>
       <p className="mt-4 max-w-2xl text-xs text-subtle">
         {fa
-          ? "لوریج دستی نیست. برای هر ارز بالاترین سقف همان صرافی گرفته می‌شود؛ اگر بالای ۲۰۰ بود همان ۲۰۰ ست می‌شود. درصد سرمایه از میز، مارجین است. کلید را Save یا Test کن تا زنده بدون کار اضافه مسلح شود."
-          : "Leverage is not manual. Each coin uses that venue's highest cap, hard-capped at 200x. Capital % is margin. Save or Test keys and live arms without extra steps."}
+          ? "حداکثر اهرم را خودت می‌گذاری (۱ تا ۲۰۰). ربات از سقف خود ارز روی صرافی بالاتر نمی‌رود. درصد سرمایه مارجین است. کلید را Save یا Test کن تا زنده مسلح شود."
+          : "You set max leverage (1–200). The bot never exceeds that coin's venue max. Capital % is margin. Save or Test keys to arm live."}
       </p>
     </DeskShell>
   );

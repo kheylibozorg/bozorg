@@ -281,6 +281,50 @@ function Home() {
               {locale === "fa" ? `سقف اهرم ${s.maxLeverage ?? 200}x` : `Leverage cap ${s.maxLeverage ?? 200}x`}
             </span>
           </div>
+          <div className="mb-4 grid gap-1.5 rounded-lg border border-accent/50 bg-surface-2 p-3">
+            <Label htmlFor="desk-maxlev">{t.autoLev}</Label>
+            <Input
+              id="desk-maxlev"
+              type="number"
+              min={1}
+              max={200}
+              step={1}
+              value={maxLev}
+              disabled={!unlocked || saving}
+              onChange={(e) => setMaxLev(e.target.value)}
+            />
+            <div className="flex flex-wrap gap-1">
+              {[5, 10, 20, 25, 50, 100, 200].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  disabled={!unlocked || saving}
+                  onClick={() => setMaxLev(String(n))}
+                  className={`min-h-8 rounded-sm border px-2 text-xs ${
+                    Number(maxLev) === n
+                      ? "border-accent bg-surface text-fg"
+                      : "border-border text-muted hover:border-border-strong"
+                  } disabled:opacity-40`}
+                >
+                  {n}x
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-subtle">
+              {(() => {
+                const capN = Math.min(100, Math.max(1, Number(capital) || 10));
+                const userCap = Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200)));
+                const btc = data.universe.find((a) => a.base === "BTC") ?? data.universe[0];
+                const venueLev = Number(btc?.max_leverage) || 25;
+                const lev = Math.min(userCap, venueLev);
+                const notional = s.equityUsd * (capN / 100) * lev;
+                const coin = btc?.base ?? "BTC";
+                return locale === "fa"
+                  ? `۱ تا ۲۰۰. ربات از سقف خود ارز بالاتر نمی‌رود. الان: ${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
+                  : `1–200. Never above that coin's venue max. Now: ${capN}% margin × ${lev}x on ${coin} ≈ ${fmtUsd(notional, 0)} notional · venue max ${venueLev}x`;
+              })()}
+            </p>
+          </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <div className="grid gap-1.5">
               <Label htmlFor="desk-capital">{t.capital} %</Label>
@@ -411,50 +455,6 @@ function Home() {
                   </button>
                 ))}
               </div>
-            </div>
-            <div className="grid gap-1.5">
-              <Label htmlFor="desk-maxlev">{t.autoLev}</Label>
-              <Input
-                id="desk-maxlev"
-                type="number"
-                min={1}
-                max={200}
-                step={1}
-                value={maxLev}
-                disabled={!unlocked || saving}
-                onChange={(e) => setMaxLev(e.target.value)}
-              />
-              <div className="flex flex-wrap gap-1">
-                {[5, 10, 20, 25, 50, 100, 200].map((n) => (
-                  <button
-                    key={n}
-                    type="button"
-                    disabled={!unlocked || saving}
-                    onClick={() => setMaxLev(String(n))}
-                    className={`min-h-8 rounded-sm border px-2 text-xs ${
-                      Number(maxLev) === n
-                        ? "border-accent bg-surface-2 text-fg"
-                        : "border-border text-muted hover:border-border-strong"
-                    } disabled:opacity-40`}
-                  >
-                    {n}x
-                  </button>
-                ))}
-              </div>
-              <p className="text-xs text-subtle">
-                {(() => {
-                  const capN = Math.min(100, Math.max(1, Number(capital) || 10));
-                  const userCap = Math.min(200, Math.max(1, Math.round(Number(maxLev) || 200)));
-                  const btc = data.universe.find((a) => a.base === "BTC") ?? data.universe[0];
-                  const venueLev = Number(btc?.max_leverage) || 25;
-                  const lev = Math.min(userCap, venueLev);
-                  const notional = s.equityUsd * (capN / 100) * lev;
-                  const coin = btc?.base ?? "BTC";
-                  return locale === "fa"
-                    ? `${capN}٪ مارجین × ${lev}x روی ${coin} ≈ ${fmtUsd(notional, 0)} حجم · سقف ارز ${venueLev}x`
-                    : `${capN}% margin × ${lev}x on ${coin} ≈ ${fmtUsd(notional, 0)} notional · venue max ${venueLev}x`;
-                })()}
-              </p>
             </div>
             <div className="flex items-end">
               <Button className="w-full" onClick={saveSizing} disabled={!unlocked || saving}>
