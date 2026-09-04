@@ -1,4 +1,12 @@
 {
   "buildCommand": "npm run build",
-  "installCommand": "npm install"
+  "installCommand": "npm install",
+  "functions": {
+    "src/routes/api/tick.ts": {
+      "maxDuration": 60
+    },
+    "src/routes/**": {
+      "maxDuration": 60
+    }
+  }
 }

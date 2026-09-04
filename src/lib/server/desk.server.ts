@@ -28,6 +28,9 @@ export type SettingsRow = {
   scan_done_15m?: number | null;
   scan_done_1h?: number | null;
   scan_done_4h?: number | null;
+  scan_cursors?: string | null;
+  orphan_fills?: string | null;
+  tick_lock_id?: string | null;
   lighter_api_key: string | null;
   lighter_api_private_key: string | null;
   lighter_account_index: number | null;
@@ -156,6 +159,21 @@ async function revealSecrets(row: SettingsRow): Promise<SettingsRow> {
   return next;
 }
 
+async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>>) {
+  const stmts = [
+    "alter table desk_settings add column if not exists scan_cursors text not null default '{}'",
+    "alter table desk_settings add column if not exists orphan_fills text not null default '[]'",
+    "alter table desk_settings add column if not exists tick_lock_id text",
+  ];
+  for (const ddl of stmts) {
+    try {
+      await sql.query(ddl);
+    } catch {
+      /* already present or migrate 0018 applies it */
+    }
+  }
+}
+
 export async function getSettings(): Promise<SettingsRow> {
   const sql = await getSql();
   const rows = await sql<SettingsRow>`select * from desk_settings where id = 1`;
@@ -176,6 +194,7 @@ export async function getSettings(): Promise<SettingsRow> {
       /* migrate 0017 applies this; ignore if already present */
     }
   }
+  await ensureTickHardeningColumns(sql);
   // DESK_TOKEN never auto-rotates. The only writer of a new random token is
   // rotateTickToken() — the Always-on "Rotate token" button.
   const pinned = readPinnedToken();
@@ -567,20 +586,58 @@ export async function alreadyFilled(opts: {
 
 export async function acquireTickLock() {
   const sql = await getSql();
-  const token = new Date().toISOString();
+  await ensureTickHardeningColumns(sql);
+  const token = randomBytes(12).toString("hex");
   try {
     const rows = await sql<{ id: number }>`
       update desk_settings
-      set tick_lock_at = ${token}::timestamptz
+      set tick_lock_at = now(), tick_lock_id = ${token}
       where id = 1
-        and (tick_lock_at is null or tick_lock_at < now() - interval '70 seconds')
+        and (
+          tick_lock_id is null
+          or tick_lock_at is null
+          or tick_lock_at < now() - interval '20 seconds'
+        )
       returning id
     `;
-    return rows[0] ? token : null;
+    if (rows[0]) return token;
+    return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    if (/tick_lock_id|does not exist/i.test(msg)) {
+      try {
+        const rows = await sql<{ id: number }>`
+          update desk_settings
+          set tick_lock_at = ${new Date().toISOString()}::timestamptz
+          where id = 1
+            and (tick_lock_at is null or tick_lock_at < now() - interval '20 seconds')
+          returning id
+        `;
+        return rows[0] ? token : null;
+      } catch (err2) {
+        const msg2 = err2 instanceof Error ? err2.message : String(err2);
+        if (/tick_lock_at|does not exist/i.test(msg2)) return token;
+        throw err2;
+      }
+    }
     if (/tick_lock_at|does not exist/i.test(msg)) return token;
     throw err;
+  }
+}
+
+export async function heartbeatTickLock(token: string) {
+  if (!token) return false;
+  const sql = await getSql();
+  try {
+    const rows = await sql<{ id: number }>`
+      update desk_settings
+      set tick_lock_at = now()
+      where id = 1 and tick_lock_id = ${token}
+      returning id
+    `;
+    return Boolean(rows[0]);
+  } catch {
+    return false;
   }
 }
 
@@ -589,11 +646,19 @@ export async function releaseTickLock(token: string) {
   try {
     await sql`
       update desk_settings
-      set tick_lock_at = null
-      where id = 1 and tick_lock_at = ${token}::timestamptz
+      set tick_lock_at = null, tick_lock_id = null
+      where id = 1 and tick_lock_id = ${token}
     `;
   } catch {
-    /* lock column may be missing on a fresh paste-schema */
+    try {
+      await sql`
+        update desk_settings
+        set tick_lock_at = null
+        where id = 1
+      `;
+    } catch {
+      /* lock column may be missing on a fresh paste-schema */
+    }
   }
 }
 
@@ -906,15 +971,96 @@ export async function logScan(
 export async function setScanCursor(n: number) {
   const sql = await getSql();
   await sql`update desk_settings set scan_cursor = ${n} where id = 1`;
+  try {
+    await sql`update desk_settings set scan_cursors = '{}' where id = 1`;
+  } catch {
+    /* column may be missing until migrate */
+  }
+}
+
+export type OrphanFill = {
+  venue: string;
+  symbol: string;
+  side: string;
+  qty: number;
+  entry: number;
+  sl: number;
+  tp: number;
+  leverage: number;
+  notional: number;
+  risk: number;
+  fees: number;
+  timeframe: string;
+  indicator: string;
+  barTime?: number;
+  orderId?: string;
+  origSl?: number;
+  reason?: string;
+  at: number;
+};
+
+function parseOrphans(raw: unknown): OrphanFill[] {
+  let obj: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      obj = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(obj)) return [];
+  return obj.filter((x): x is OrphanFill => Boolean(x) && typeof x === "object" && typeof (x as OrphanFill).symbol === "string");
+}
+
+export async function listOrphanFills(): Promise<OrphanFill[]> {
+  const sql = await getSql();
+  await ensureTickHardeningColumns(sql);
+  try {
+    const rows = await sql<{ orphan_fills: string | null }>`select orphan_fills from desk_settings where id = 1`;
+    return parseOrphans(rows[0]?.orphan_fills);
+  } catch {
+    return [];
+  }
+}
+
+export async function rememberOrphanFill(fill: Omit<OrphanFill, "at"> & { at?: number }) {
+  const sql = await getSql();
+  await ensureTickHardeningColumns(sql);
+  const next: OrphanFill = { ...fill, at: fill.at ?? Date.now() };
+  const cur = await listOrphanFills();
+  const rest = cur.filter((x) => x.symbol !== next.symbol);
+  rest.push(next);
+  const clipped = rest.slice(-20);
+  await sql`update desk_settings set orphan_fills = ${JSON.stringify(clipped)} where id = 1`;
+}
+
+export async function dropOrphanFill(symbol: string) {
+  const sql = await getSql();
+  const cur = await listOrphanFills();
+  const next = cur.filter((x) => x.symbol !== symbol);
+  if (next.length === cur.length) return;
+  try {
+    await sql`update desk_settings set orphan_fills = ${JSON.stringify(next)} where id = 1`;
+  } catch {
+    /* ignore */
+  }
 }
 
 export async function markScanProgress(opts: {
   cursor: number;
   epochMs: number;
+  cursors?: Record<string, { c: number; e: number }>;
   done?: { "5m"?: number; "15m"?: number; "1h"?: number; "4h"?: number };
 }) {
   const sql = await getSql();
   await sql`update desk_settings set scan_cursor = ${opts.cursor}, scan_epoch_ms = ${opts.epochMs} where id = 1`;
+  if (opts.cursors) {
+    try {
+      await sql`update desk_settings set scan_cursors = ${JSON.stringify(opts.cursors)} where id = 1`;
+    } catch {
+      /* column may be missing until migrate */
+    }
+  }
   const d = opts.done;
   if (!d) return;
   if (d["5m"] != null) await sql`update desk_settings set scan_done_5m = ${d["5m"]} where id = 1`;

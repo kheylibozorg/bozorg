@@ -8,10 +8,13 @@ import {
   dueTimeframes,
   isFreshSignal,
   latestClosedOpen,
+  nextTfCursor,
+  parseCursors,
+  prefixCompleted,
   scanLastN,
-  shouldResetCursor,
+  type TfCursor,
 } from "@/lib/engine/scan-schedule";
-import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
+import { bookVenue, chartHostLabel, coinOf, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
 import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
 import { capLeverage } from "@/lib/exchanges/lev-cap";
 import type { ExchangeAccount } from "@/lib/exchanges/types";
@@ -20,13 +23,17 @@ import {
   acquireTickLock,
   bumpEquity,
   closePosition,
+  dropOrphanFill,
   getSettings,
+  heartbeatTickLock,
   insertPosition,
   insertSignal,
   listOpenPositions,
+  listOrphanFills,
   listUniverse,
   logScan,
   publicSettings,
+  rememberOrphanFill,
   releaseTickLock,
   replaceUniverse,
   setScanCursor,
@@ -42,9 +49,20 @@ import { trexBeAtR } from "@/lib/engine/trex";
 const SCAN_BARS = 360;
 const MIN_BARS = WARMUP + 12;
 const SCAN_CONCURRENCY = 12;
-const TICK_BUDGET_MS = 50_000;
 const MAX_BATCH = 250;
 const UNIVERSE_TTL_MS = 30 * 60_000;
+const LOCK_HEARTBEAT_MS = 7_000;
+
+export function tickBudgetMs() {
+  const override = Number(process.env.TICK_BUDGET_MS);
+  if (Number.isFinite(override) && override >= 3_000) return Math.min(55_000, override);
+  if (process.env.VERCEL) {
+    const cap = Number(process.env.VERCEL_MAX_DURATION);
+    if (Number.isFinite(cap) && cap >= 15) return Math.min(55_000, cap * 1000 - 2_000);
+    return 8_000;
+  }
+  return 45_000;
+}
 
 type StampedAsset = Awaited<ReturnType<typeof fetchVenueUniverse>>[number];
 let universeCache: { at: number; venue: VenueId; assets: StampedAsset[] } | null = null;
@@ -88,6 +106,12 @@ const ORPHAN_MARK = "UNPROTECTED flatten failed";
 
 function isOrphanPosition(pos: { signal_reason?: string | null }) {
   return typeof pos.signal_reason === "string" && pos.signal_reason.includes(ORPHAN_MARK);
+}
+
+function deskSymbolOf(raw: string, universe: Array<{ symbol: string }>) {
+  const coin = coinOf(raw);
+  const hit = universe.find((a) => coinOf(a.symbol) === coin);
+  return hit?.symbol ?? `${coin}USDT`;
 }
 
 async function mapPool<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -215,9 +239,14 @@ export async function runTick(opts?: { forceUniverse?: boolean; batch?: number; 
       public: publicSettings(await getSettings()),
     };
   }
+  const hb = setInterval(() => {
+    void heartbeatTickLock(lock);
+  }, LOCK_HEARTBEAT_MS);
+  hb.unref?.();
   try {
     return await runTickBody({ ...opts, source, t0 });
   } finally {
+    clearInterval(hb);
     await releaseTickLock(lock);
   }
 }
@@ -298,6 +327,48 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     } catch {
       /* keep desk equity */
     }
+    try {
+      const pending = await listOrphanFills();
+      for (const o of pending) {
+        try {
+          const res = await adapter.closePosition(acc, venueSymbol(venue, o.symbol));
+          if (res.ok || res.message === "flat") {
+            await dropOrphanFill(o.symbol);
+            continue;
+          }
+        } catch {
+          /* book a desk row so the open-loop retry can flatten */
+        }
+        try {
+          const id = await insertPosition({
+            mode: "live",
+            venue,
+            symbol: o.symbol,
+            timeframe: o.timeframe || "5m",
+            indicator: o.indicator || "ORPHAN",
+            side: o.side,
+            entry: o.entry,
+            sl: o.sl,
+            tp: o.tp,
+            qty: o.qty,
+            leverage: o.leverage,
+            notional: o.notional,
+            risk: o.risk,
+            fees: o.fees,
+            orderId: o.orderId,
+            barTime: o.barTime,
+            origSl: o.origSl ?? o.sl,
+            signalReason: `${o.reason ?? ""} · ${ORPHAN_MARK}`,
+            margin: o.notional / Math.max(1, o.leverage),
+          });
+          if (id) await dropOrphanFill(o.symbol);
+        } catch {
+          /* keep the JSON breadcrumb */
+        }
+      }
+    } catch {
+      /* orphan column may be missing until migrate */
+    }
   }
 
   for (const pos of open) {
@@ -336,6 +407,41 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       } catch {
         /* still walk SL/TP below; retry flatten next tick */
       }
+    }
+    if (live && adapter && pos.mode === "live") {
+      const bars = lastBars.get(pos.symbol);
+      const last = bars?.[bars.length - 1];
+      const beAtR = trexBeAtR(pos.indicator);
+      if (last && beAtR) {
+        const side = pos.side as "long" | "short";
+        const entry = Number(pos.entry);
+        const origPx = origStopPx({
+          side,
+          entry,
+          sl: Number(pos.sl),
+          origSl: pos.orig_sl,
+          qty: pos.qty,
+          risk: pos.risk_usd,
+        });
+        const dist = Math.abs(entry - origPx);
+        const alreadyBe = Math.abs(Number(pos.sl) - entry) <= 1e-8 * Math.max(1, entry);
+        const fav = side === "long" ? last.close - entry : entry - last.close;
+        if (!alreadyBe && dist > 0 && fav >= beAtR * dist) {
+          try {
+            const res = await adapter.updateStop(acc, {
+              symbol: venueSymbol(venue, pos.symbol),
+              side,
+              sl: entry,
+              tp: Number(pos.tp),
+              qty: Number(pos.qty),
+            });
+            if (res.ok) await updatePositionSl(pos.id, entry);
+          } catch {
+            /* keep original stop on desk and venue */
+          }
+        }
+      }
+      continue;
     }
     const bars = lastBars.get(pos.symbol);
     if (!bars?.length) continue;
@@ -460,6 +566,70 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         await bumpEquity(pnl);
         closed += 1;
       }
+      const stillAfter = await listOpenPositions();
+      for (const ex of exPos) {
+        const tracked = stillAfter.some(
+          (p) =>
+            p.mode === "live" &&
+            (sameCoin(p.symbol, ex.symbol) || sameCoin(venueSymbol(venue, p.symbol), ex.symbol)),
+        );
+        if (tracked) continue;
+        const sym = deskSymbolOf(ex.symbol, universe);
+        let flat = false;
+        try {
+          const res = await adapter.closePosition(acc, ex.symbol);
+          flat = res.ok || res.message === "flat";
+        } catch {
+          flat = false;
+        }
+        if (flat) {
+          await dropOrphanFill(sym).catch(() => undefined);
+          continue;
+        }
+        try {
+          const id = await insertPosition({
+            mode: "live",
+            venue,
+            symbol: sym,
+            timeframe: "5m",
+            indicator: "ORPHAN",
+            side: ex.side,
+            entry: ex.entry || 0,
+            sl: ex.entry || 0,
+            tp: ex.entry || 0,
+            qty: ex.qty,
+            leverage: ex.leverage || 1,
+            notional: Math.abs((ex.entry || 0) * ex.qty),
+            risk: 0,
+            fees: 0,
+            signalReason: ORPHAN_MARK,
+            margin: Math.abs((ex.entry || 0) * ex.qty) / Math.max(1, ex.leverage || 1),
+          });
+          if (id) continue;
+        } catch {
+          /* persist JSON next */
+        }
+        try {
+          await rememberOrphanFill({
+            venue,
+            symbol: sym,
+            side: ex.side,
+            qty: ex.qty,
+            entry: ex.entry || 0,
+            sl: ex.entry || 0,
+            tp: ex.entry || 0,
+            leverage: ex.leverage || 1,
+            notional: Math.abs((ex.entry || 0) * ex.qty),
+            risk: 0,
+            fees: 0,
+            timeframe: "5m",
+            indicator: "ORPHAN",
+            reason: ORPHAN_MARK,
+          });
+        } catch {
+          /* next fetchPositions retries */
+        }
+      }
     } catch {
       /* venue read failed — keep desk rows */
     }
@@ -501,14 +671,33 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const tradeable = universe;
   const batch = resolveBatch(opts?.batch ?? Number(settings.scan_batch), tradeable.length);
   const closed5m = latestClosedOpen(TF_MS["5m"], nowMs);
-  const epoch = Number(settings.scan_epoch_ms) || 0;
-  let cursor = Number(settings.scan_cursor) || 0;
-  if (shouldResetCursor(epoch, closed5m, tfs)) cursor = 0;
-  const slice: typeof tradeable = [];
-  if (tradeable.length) {
+  const cursors = parseCursors(settings.scan_cursors);
+  if (!settings.scan_cursors) {
+    const legacy = Number(settings.scan_cursor) || 0;
+    const epoch = Number(settings.scan_epoch_ms) || 0;
+    cursors["5m"] = { c: legacy, e: epoch };
+  }
+  type TfWork = { tf: Timeframe; closedOpen: number; cur: number; slice: typeof tradeable; done: boolean[] };
+  const tfWork: TfWork[] = tfs.map((tf) => {
+    const closedOpen = latestClosedOpen(TF_MS[tf], nowMs);
+    const saved = cursors[tf] ?? { c: 0, e: 0 };
+    const cur = saved.e !== closedOpen && closedOpen > 0 ? 0 : saved.c;
+    const slice: typeof tradeable = [];
     const n = Math.min(batch, tradeable.length);
-    for (let k = 0; k < n; k++) {
-      slice.push(tradeable[(cursor + k) % tradeable.length]!);
+    for (let k = 0; k < n; k++) slice.push(tradeable[(cur + k) % Math.max(1, tradeable.length)]!);
+    return { tf, closedOpen, cur, slice, done: slice.map(() => false) };
+  });
+  const planned = new Map<string, Timeframe[]>();
+  const slice: typeof tradeable = [];
+  for (const work of tfWork) {
+    for (const a of work.slice) {
+      const list = planned.get(a.symbol);
+      if (list) {
+        if (!list.includes(work.tf)) list.push(work.tf);
+      } else {
+        planned.set(a.symbol, [work.tf]);
+        slice.push(a);
+      }
     }
   }
 
@@ -527,17 +716,19 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   };
   const found: Found[] = [];
   const seenSig = new Set<string>();
-  const deadline = t0 + TICK_BUDGET_MS;
+  const deadline = t0 + tickBudgetMs();
   let scannedCoins = 0;
   let tried = 0;
   const lastN = scanLastN(opts.source);
+  const finished = new Set<string>();
 
   await mapPool(slice, SCAN_CONCURRENCY, async (asset) => {
     if (Date.now() > deadline) return;
     tried += 1;
     try {
-    const need = new Set<KlineTf>(tfs);
-    for (const tf of tfs) {
+    const tfsHere = planned.get(asset.symbol) ?? tfs;
+    const need = new Set<KlineTf>(tfsHere);
+    for (const tf of tfsHere) {
       need.add(HTF_OF[tf]);
       need.add(HTF2_OF[tf]);
     }
@@ -553,7 +744,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       }),
     );
     let any = false;
-    for (const tf of tfs) {
+    for (const tf of tfsHere) {
       const raw = loaded.get(tf) ?? [];
       const closedBars = onlyClosedBars(raw, tf);
       if (closedBars.length < MIN_BARS) continue;
@@ -593,21 +784,38 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     } catch {
       /* one coin must not abort the rest of the tick */
     }
+    finished.add(asset.symbol);
+    for (const work of tfWork) {
+      const idx = work.slice.findIndex((a) => a.symbol === asset.symbol);
+      if (idx >= 0) work.done[idx] = true;
+    }
   });
 
-  const scanIncomplete = Boolean(slice.length) && tried < slice.length;
+  const scanIncomplete = Boolean(slice.length) && finished.size < slice.length;
   if (tradeable.length && slice.length) {
-    const nextRaw = cursor + Math.max(0, tried);
-    const wrapped = nextRaw >= tradeable.length && tried > 0;
-    const next = wrapped ? 0 : nextRaw % Math.max(1, tradeable.length);
-    let done: { "5m"?: number; "15m"?: number; "1h"?: number; "4h"?: number } | undefined;
-    if (wrapped) {
-      const n = Date.now();
-      done = {};
-      for (const tf of tfs) done[tf] = latestClosedOpen(TF_MS[tf], n);
+    const nextCursors: Record<string, TfCursor> = { ...cursors };
+    const done: { "5m"?: number; "15m"?: number; "1h"?: number; "4h"?: number } = {};
+    let next = Number(settings.scan_cursor) || 0;
+    for (const work of tfWork) {
+      const prefix = prefixCompleted(work.done);
+      const stepped = nextTfCursor({
+        cur: work.cur,
+        epoch: work.closedOpen,
+        closedOpen: work.closedOpen,
+        universeLen: tradeable.length,
+        prefixDone: prefix,
+      });
+      nextCursors[work.tf] = stepped.cursor;
+      if (work.tf === "5m") next = stepped.cursor.c;
+      if (stepped.wrapped) done[work.tf] = work.closedOpen;
     }
     try {
-      await markScanProgress({ cursor: next, epochMs: closed5m, done });
+      await markScanProgress({
+        cursor: next,
+        epochMs: closed5m,
+        cursors: nextCursors,
+        done: Object.keys(done).length ? done : undefined,
+      });
     } catch {
       await setScanCursor(next);
     }
@@ -729,6 +937,37 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           async function bookOrphan() {
             return insertPosition({ ...fill, signalReason: `${s.reason} · ${ORPHAN_MARK}` });
           }
+          async function stashOrphan() {
+            try {
+              await rememberOrphanFill({
+                venue: fill.venue,
+                symbol: fill.symbol,
+                side: fill.side,
+                qty: fill.qty,
+                entry: fill.entry,
+                sl: fill.sl,
+                tp: fill.tp,
+                leverage: fill.leverage,
+                notional: fill.notional,
+                risk: fill.risk,
+                fees: fill.fees,
+                timeframe: fill.timeframe,
+                indicator: fill.indicator,
+                barTime: fill.barTime,
+                orderId: fill.orderId,
+                origSl: fill.origSl,
+                reason: s.reason,
+              });
+              return true;
+            } catch {
+              try {
+                await logScan(0, 0, 0, 0, 0, `${ORPHAN_MARK} ${fill.symbol}`, opts.source, { touch: false });
+              } catch {
+                /* venue fetchPositions still retries next tick */
+              }
+              return false;
+            }
+          }
           try {
             const id = await insertPosition({ ...fill, signalReason: reason });
             if (!id) {
@@ -743,6 +982,9 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                     opened += 1;
                     usedMargin += sized.margin;
                     taken = true;
+                    skip = ORPHAN_MARK;
+                  } else {
+                    await stashOrphan();
                     skip = ORPHAN_MARK;
                   }
                 }
@@ -769,9 +1011,13 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                     usedMargin += sized.margin;
                     taken = true;
                     skip = ORPHAN_MARK;
+                  } else {
+                    await stashOrphan();
+                    skip = ORPHAN_MARK;
                   }
                 } catch {
-                  /* still untracked */
+                  await stashOrphan();
+                  skip = ORPHAN_MARK;
                 }
               }
             }

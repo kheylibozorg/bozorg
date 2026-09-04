@@ -7,11 +7,16 @@ import {
   emptyScanDone,
   isFreshSignal,
   latestClosedOpen,
+  nextTfCursor,
+  parseCursors,
+  prefixCompleted,
   scanLastN,
   shouldResetCursor,
 } from "./scan-schedule.ts";
 
 const T5 = TF_MS["5m"];
+const T15 = TF_MS["15m"];
+const T1H = TF_MS["1h"];
 
 describe("latestClosedOpen", () => {
   it("at exact 5m close returns the bar that just closed", () => {
@@ -55,6 +60,16 @@ describe("dueTimeframes", () => {
     const oldOpen = close - T5;
     assert.equal(isFreshSignal(oldOpen, "5m", close + T5 + 1_000), false);
   });
+  it("cron keeps sweeping 15m for the rest of the next 15m bar", () => {
+    const close = Date.UTC(2026, 0, 1, 12, 15, 0);
+    const tfs = dueTimeframes(close + 8 * 60_000, emptyScanDone(), "cloudflare");
+    assert.ok(tfs.includes("15m"));
+  });
+  it("cron keeps sweeping 1h for 20 minutes so a 200-coin book can finish", () => {
+    const close = Date.UTC(2026, 0, 1, 13, 0, 0);
+    const tfs = dueTimeframes(close + 20 * 60_000, emptyScanDone(), "cloudflare");
+    assert.ok(tfs.includes("1h"));
+  });
 });
 
 describe("isFreshSignal", () => {
@@ -74,21 +89,59 @@ describe("isFreshSignal", () => {
     const close = Date.UTC(2026, 0, 1, 12, 5, 0);
     assert.equal(isFreshSignal(close, "5m", close + 30_000), false);
   });
+  it("accepts a 15m close 8 minutes later", () => {
+    const close = Date.UTC(2026, 0, 1, 12, 15, 0);
+    const open = close - T15;
+    assert.equal(isFreshSignal(open, "15m", close + 8 * 60_000), true);
+  });
 });
 
-describe("scanLastN / cursor reset", () => {
+describe("scanLastN / per-TF cursor", () => {
   it("cron looks at exactly one closed bar", () => {
     assert.equal(scanLastN("cloudflare"), 1);
     assert.equal(scanLastN("backup"), 1);
     assert.equal(scanLastN("watchdog"), 1);
     assert.equal(scanLastN("manual"), 4);
   });
-  it("resets the universe cursor on a new 5m close", () => {
+  it("resets a TF cursor when that TF has a new closed bar", () => {
     const close = Date.UTC(2026, 0, 1, 12, 5, 0);
     const bar = close - T5;
-    assert.equal(shouldResetCursor(0, bar, ["5m"]), true);
-    assert.equal(shouldResetCursor(bar, bar, ["5m"]), false);
-    assert.equal(shouldResetCursor(bar - T5, bar, ["5m"]), true);
-    assert.equal(shouldResetCursor(0, bar, ["15m"]), false);
+    assert.equal(shouldResetCursor(0, bar), true);
+    assert.equal(shouldResetCursor(bar, bar), false);
+    assert.equal(shouldResetCursor(bar - T5, bar), true);
+  });
+  it("does not let a 5m wrap steal an unfinished 1h sweep", () => {
+    const h1Close = Date.UTC(2026, 0, 1, 13, 0, 0);
+    const h1Open = h1Close - T1H;
+    const later5m = h1Close + 5 * T5;
+    const h1 = nextTfCursor({
+      cur: 80,
+      epoch: h1Open,
+      closedOpen: latestClosedOpen(T1H, later5m),
+      universeLen: 200,
+      prefixDone: 40,
+    });
+    assert.equal(h1.wrapped, false);
+    assert.equal(h1.cursor.c, 120);
+    assert.equal(h1.cursor.e, h1Open);
+  });
+  it("advances only the consecutive prefix so a killed tick does not skip coins", () => {
+    assert.equal(prefixCompleted([true, true, false, true]), 2);
+    assert.equal(prefixCompleted([false, true]), 0);
+    const wrap = nextTfCursor({
+      cur: 180,
+      epoch: 1,
+      closedOpen: 1,
+      universeLen: 200,
+      prefixDone: 20,
+    });
+    assert.equal(wrap.wrapped, true);
+    assert.equal(wrap.cursor.c, 0);
+  });
+  it("parses stored per-TF cursors", () => {
+    const got = parseCursors('{"5m":{"c":40,"e":9},"1h":{"c":12,"e":8}}');
+    assert.equal(got["5m"].c, 40);
+    assert.equal(got["1h"].c, 12);
+    assert.equal(got["15m"].c, 0);
   });
 });

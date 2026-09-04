@@ -7,20 +7,83 @@ export const CRON_STALE_MS = 90_000;
 
 /**
  * How long after a bar's close we still accept a fill.
- * 5m: the whole next 5m bar (same candle Pine would fill into).
- * Higher TFs: five minutes — later than that the move is already gone.
+ * Window must cover a full universe sweep at one cron ping per minute,
+ * even when Vercel kills the function at ~10s (≈30–40 coins/tick).
  */
 export const FRESH_MS: Record<Timeframe, number> = {
   "5m": TF_MS["5m"] - 3_000,
-  "15m": 5 * 60_000,
-  "1h": 5 * 60_000,
-  "4h": 5 * 60_000,
+  "15m": TF_MS["15m"] - 3_000,
+  "1h": 25 * 60_000,
+  "4h": 25 * 60_000,
 };
 
 export type ScanDone = Record<Timeframe, number>;
 
+export type TfCursor = { c: number; e: number };
+
 export function emptyScanDone(): ScanDone {
   return { "5m": 0, "15m": 0, "1h": 0, "4h": 0 };
+}
+
+export function emptyCursors(): Record<Timeframe, TfCursor> {
+  return { "5m": { c: 0, e: 0 }, "15m": { c: 0, e: 0 }, "1h": { c: 0, e: 0 }, "4h": { c: 0, e: 0 } };
+}
+
+export function parseCursors(raw: unknown): Record<Timeframe, TfCursor> {
+  const out = emptyCursors();
+  let obj: unknown = raw;
+  if (typeof raw === "string") {
+    const t = raw.trim();
+    if (!t) return out;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      return out;
+    }
+  }
+  if (!obj || typeof obj !== "object") return out;
+  const rec = obj as Record<string, { c?: unknown; e?: unknown } | number>;
+  for (const tf of SCAN_TFS) {
+    const row = rec[tf];
+    if (typeof row === "number" && Number.isFinite(row)) {
+      out[tf] = { c: Math.max(0, Math.floor(row)), e: 0 };
+      continue;
+    }
+    if (!row || typeof row !== "object") continue;
+    const c = Number(row.c);
+    const e = Number(row.e);
+    out[tf] = {
+      c: Number.isFinite(c) ? Math.max(0, Math.floor(c)) : 0,
+      e: Number.isFinite(e) ? e : 0,
+    };
+  }
+  return out;
+}
+
+/** Consecutive completed items from the start of a planned slice. */
+export function prefixCompleted(done: boolean[]): number {
+  let n = 0;
+  while (n < done.length && done[n]) n += 1;
+  return n;
+}
+
+export function nextTfCursor(opts: {
+  cur: number;
+  epoch: number;
+  closedOpen: number;
+  universeLen: number;
+  prefixDone: number;
+}): { cursor: TfCursor; wrapped: boolean } {
+  const start = shouldResetCursor(opts.epoch, opts.closedOpen) ? 0 : opts.cur;
+  const len = Math.max(0, opts.universeLen);
+  const prefix = Math.max(0, Math.min(opts.prefixDone, len || opts.prefixDone));
+  if (!len) return { cursor: { c: 0, e: opts.closedOpen }, wrapped: false };
+  const nextRaw = start + prefix;
+  const wrapped = nextRaw >= len && prefix > 0;
+  return {
+    cursor: { c: wrapped ? 0 : nextRaw % len, e: opts.closedOpen },
+    wrapped,
+  };
 }
 
 /** Open time of the latest fully closed bar. */
@@ -66,7 +129,7 @@ export function isFreshSignal(barOpen: number, tf: Timeframe, now: number): bool
   return age >= -2_000 && age <= FRESH_MS[tf];
 }
 
-/** Start a new universe sweep when a fresh 5m close appears. */
-export function shouldResetCursor(epochMs: number, latestClosed5m: number, tfs: Timeframe[]): boolean {
-  return tfs.includes("5m") && latestClosed5m > 0 && latestClosed5m !== epochMs;
+/** Start a new sweep for this TF when its latest closed bar changes. */
+export function shouldResetCursor(epochMs: number, latestClosed: number): boolean {
+  return latestClosed > 0 && latestClosed !== epochMs;
 }
