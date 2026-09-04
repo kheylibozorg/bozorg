@@ -3,7 +3,7 @@ import { signedQuery } from "./hmac";
 import { roundToStep } from "./qty";
 import { capLeverage } from "./lev-cap";
 import { listedFromToobitContracts, listedFromToobitTickers } from "./toobit-listed";
-import type { ExchangeAdapter, ListedMarket, PlaceOrderInput, PlaceOrderResult, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, UpdateStopInput } from "./types";
 
 const BASE = "https://api.toobit.com";
 
@@ -83,6 +83,125 @@ async function signed(
   return json;
 }
 
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function pxClose(a: number, b: number) {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return Math.abs(a - b) < 1e-8;
+  return Math.abs(a - b) / Math.abs(b) < 0.015;
+}
+
+type ToobitPos = {
+  symbol?: string;
+  position?: string | number;
+  positionAmt?: string | number;
+  side?: string;
+  stopLoss?: string | number;
+  takeProfit?: string | number;
+  sl?: string | number;
+  tp?: string | number;
+  stopLossPrice?: string | number;
+  takeProfitPrice?: string | number;
+};
+
+type ToobitOpen = {
+  symbol?: string;
+  type?: string;
+  origType?: string;
+  orderType?: string;
+  stopPrice?: string | number;
+  price?: string | number;
+  side?: string;
+};
+
+function orderKind(o: ToobitOpen): "sl" | "tp" | null {
+  const blob = `${o.type ?? ""} ${o.origType ?? ""} ${o.orderType ?? ""} ${o.side ?? ""}`.toUpperCase();
+  if (blob.includes("LOSS")) return "sl";
+  if (blob.includes("PROFIT")) return "tp";
+  return null;
+}
+
+async function readProtection(
+  account: { apiKey: string; apiSecret: string },
+  symbol: string,
+  sl: number,
+  tp: number,
+): Promise<{ size: number; hasSl: boolean; hasTp: boolean; sideLong: boolean }> {
+  const [posRaw, openRaw] = await Promise.all([
+    signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", { symbol }).catch(() => []),
+    signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/openOrders", { symbol }).catch(() => []),
+  ]);
+  const positions = (Array.isArray(posRaw) ? posRaw : []) as ToobitPos[];
+  const pos = positions.find((p) => Math.abs(Number(p.position ?? p.positionAmt ?? 0)) > 0);
+  const size = Math.abs(Number(pos?.position ?? pos?.positionAmt ?? 0));
+  const sideLabel = (pos?.side ?? "").toUpperCase();
+  const sideLong = sideLabel === "LONG" || (sideLabel !== "SHORT" && Number(pos?.position ?? 0) > 0);
+  let hasSl = pxClose(Number(pos?.stopLoss ?? pos?.sl ?? pos?.stopLossPrice ?? 0), sl);
+  let hasTp = pxClose(Number(pos?.takeProfit ?? pos?.tp ?? pos?.takeProfitPrice ?? 0), tp);
+  const opens = (Array.isArray(openRaw) ? openRaw : []) as ToobitOpen[];
+  for (const o of opens) {
+    const k = orderKind(o);
+    const px = Number(o.stopPrice ?? o.price ?? 0);
+    if (k === "sl") hasSl = true;
+    else if (k === "tp") hasTp = true;
+    else if (pxClose(px, sl)) hasSl = true;
+    else if (pxClose(px, tp)) hasTp = true;
+  }
+  return { size, hasSl, hasTp, sideLong };
+}
+
+function flattenMessage(closed: PlaceOrderResult, why: string, orderId?: string): PlaceOrderResult {
+  const flat = closed.ok || closed.message === "flat";
+  if (flat) {
+    return { ok: false, message: `${why} — flattened, no unprotected position left` };
+  }
+  return {
+    ok: false,
+    liveOpen: true,
+    orderId,
+    message: `${why} — flatten failed (${closed.message})`,
+  };
+}
+
+async function attachStops(
+  account: { apiKey: string; apiSecret: string },
+  symbol: string,
+  sideLong: boolean,
+  sl: number,
+  tp: number,
+) {
+  await signed(account.apiKey, account.apiSecret, "POST", "/api/v1/futures/position/trading-stop", {
+    symbol,
+    side: sideLong ? "LONG" : "SHORT",
+    slTriggerBy: "MARK_PRICE",
+    tpTriggerBy: "MARK_PRICE",
+    stopLoss: String(sl),
+    takeProfit: String(tp),
+  });
+}
+
+async function marketCloseToobit(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
+  if (!account.apiKey || !account.apiSecret) return { ok: false, message: "Toobit API key missing" };
+  const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
+    symbol,
+  })) as Array<{ position: string; side?: string }>;
+  const row = rows.find((r) => Number(r.position) !== 0) ?? rows[0];
+  if (!row || Number(row.position) === 0) return { ok: true, message: "flat" };
+  const sideLabel = (row.side ?? "").toUpperCase();
+  const long = sideLabel === "LONG" || (sideLabel !== "SHORT" && Number(row.position) > 0);
+  const side = long ? "SELL_CLOSE" : "BUY_CLOSE";
+  await signed(account.apiKey, account.apiSecret, "POST", "/api/v1/futures/order", {
+    symbol,
+    side,
+    type: "LIMIT",
+    priceType: "MARKET",
+    quantity: Math.abs(Number(row.position)),
+    newClientOrderId: `apex-c-${Date.now()}`,
+  });
+  return { ok: true, message: "closed" };
+}
+
 export const toobitAdapter: ExchangeAdapter = {
   id: "toobit",
   label: "Toobit",
@@ -148,6 +267,7 @@ export const toobitAdapter: ExchangeAdapter = {
   },
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     if (!account.apiKey || !account.apiSecret) return { ok: false, message: "Toobit API key missing" };
+    const keys = { apiKey: account.apiKey, apiSecret: account.apiSecret };
     try {
       const rows = await loadContracts();
       const spec = contractOf(rows, order.symbol);
@@ -161,7 +281,7 @@ export const toobitAdapter: ExchangeAdapter = {
       }
       const lev = capLeverage(Math.min(order.leverage, spec.maxLeverage || order.leverage));
       try {
-        await signed(account.apiKey, account.apiSecret, "POST", "/api/v1/futures/leverage", {
+        await signed(keys.apiKey, keys.apiSecret, "POST", "/api/v1/futures/leverage", {
           symbol: order.symbol,
           leverage: lev,
         });
@@ -169,25 +289,70 @@ export const toobitAdapter: ExchangeAdapter = {
         /* ignore */
       }
       const side = order.side === "long" ? "BUY_OPEN" : "SELL_OPEN";
-      const data = (await signed(account.apiKey, account.apiSecret, "POST", "/api/v1/futures/order", {
-        symbol: order.symbol,
-        side,
-        type: "LIMIT",
-        priceType: "MARKET",
-        quantity: contracts,
-        newClientOrderId: `apex-${Date.now()}`,
-        takeProfit: String(order.tp),
-        stopLoss: String(order.sl),
-        tpTriggerBy: "MARK_PRICE",
-        slTriggerBy: "MARK_PRICE",
-        tpOrderType: "MARKET",
-        slOrderType: "MARKET",
-      })) as { orderId?: string | number };
-      return {
-        ok: true,
-        orderId: data.orderId ? String(data.orderId) : undefined,
-        message: `Toobit market ${order.side} ${contracts} ct · SL/TP on venue`,
-      };
+      let oid: string | undefined;
+      try {
+        const data = (await signed(keys.apiKey, keys.apiSecret, "POST", "/api/v1/futures/order", {
+          symbol: order.symbol,
+          side,
+          type: "LIMIT",
+          priceType: "MARKET",
+          quantity: contracts,
+          newClientOrderId: `apex-${Date.now()}`,
+          takeProfit: String(order.tp),
+          stopLoss: String(order.sl),
+          tpTriggerBy: "MARK_PRICE",
+          slTriggerBy: "MARK_PRICE",
+          tpOrderType: "MARKET",
+          slOrderType: "MARKET",
+        })) as { orderId?: string | number };
+        oid = data.orderId ? String(data.orderId) : undefined;
+      } catch (err) {
+        const afterFail = await readProtection(keys, order.symbol, order.sl, order.tp).catch(() => ({
+          size: 0,
+          hasSl: false,
+          hasTp: false,
+          sideLong: order.side === "long",
+        }));
+        if (afterFail.size <= 0) {
+          return { ok: false, message: err instanceof Error ? err.message : "Toobit order failed" };
+        }
+      }
+
+      let prot = { size: 0, hasSl: false, hasTp: false, sideLong: order.side === "long" };
+      for (let i = 0; i < 3; i++) {
+        await sleep(350);
+        prot = await readProtection(keys, order.symbol, order.sl, order.tp);
+        if (prot.hasSl && prot.hasTp) break;
+        if (prot.size > 0 && i === 1) {
+          try {
+            await attachStops(keys, order.symbol, prot.sideLong, order.sl, order.tp);
+          } catch {
+            /* verify below */
+          }
+        }
+      }
+      if (prot.size <= 0) {
+        return { ok: false, message: "Toobit IOC did not fill" };
+      }
+      if (prot.hasSl && prot.hasTp) {
+        return {
+          ok: true,
+          orderId: oid,
+          message: `Toobit market ${order.side} ${contracts} ct · SL/TP on venue`,
+        };
+      }
+      const missing = [!prot.hasSl && "SL", !prot.hasTp && "TP"].filter(Boolean).join("+");
+      try {
+        const closed = await marketCloseToobit(account, order.symbol);
+        return flattenMessage(closed, `Toobit filled but ${missing} missing`, oid);
+      } catch (err) {
+        return {
+          ok: false,
+          liveOpen: true,
+          orderId: oid,
+          message: `Toobit filled but ${missing} missing — flatten failed (${err instanceof Error ? err.message : "close threw"})`,
+        };
+      }
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Toobit order failed" };
     }
@@ -228,25 +393,8 @@ export const toobitAdapter: ExchangeAdapter = {
     }
   },
   async closePosition(account, symbol) {
-    if (!account.apiKey || !account.apiSecret) return { ok: false, message: "Toobit API key missing" };
     try {
-      const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
-        symbol,
-      })) as Array<{ position: string; side?: string }>;
-      const row = rows.find((r) => Number(r.position) !== 0) ?? rows[0];
-      if (!row || Number(row.position) === 0) return { ok: true, message: "flat" };
-      const sideLabel = (row.side ?? "").toUpperCase();
-      const long = sideLabel === "LONG" || (sideLabel !== "SHORT" && Number(row.position) > 0);
-      const side = long ? "SELL_CLOSE" : "BUY_CLOSE";
-      await signed(account.apiKey, account.apiSecret, "POST", "/api/v1/futures/order", {
-        symbol,
-        side,
-        type: "LIMIT",
-        priceType: "MARKET",
-        quantity: Math.abs(Number(row.position)),
-        newClientOrderId: `apex-c-${Date.now()}`,
-      });
-      return { ok: true, message: "closed" };
+      return await marketCloseToobit(account, symbol);
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "close failed" };
     }

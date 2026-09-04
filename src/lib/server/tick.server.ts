@@ -279,11 +279,16 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   });
 
   let equity = Number(settings.equity_usd);
+  const wantLive = settings.mode === "live" && venue !== "paper";
   const live =
-    settings.mode === "live" &&
+    wantLive &&
     Boolean(settings.live_enabled) &&
-    venue !== "paper" &&
     hasLiveKeys(settings, venue);
+  const liveBlock = wantLive && !live
+    ? !hasLiveKeys(settings, venue)
+      ? `${venue} keys incomplete — live blocked, not opening paper`
+      : `live not armed (Test ${venue} first) — not opening paper`
+    : "";
   const acc = accountFrom(settings, venue === "paper" ? "lighter" : venue);
   const adapter = live ? getAdapter(venue) : null;
   if (live && adapter) {
@@ -657,7 +662,8 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         let orderId: string | undefined;
         let placedLive = false;
         let orphan = false;
-        if (live) {
+        if (liveBlock) skip = liveBlock;
+        else if (live) {
           const ad = getAdapter(venue);
           if (!ad) skip = "no adapter";
           else if (!hasLiveKeys(settings, venue)) skip = `${venue} keys missing`;
@@ -798,7 +804,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   await snapshotEquity(Number(freshSettings.equity_usd), (await listOpenPositions()).length, freshSettings.mode);
   const ms = Date.now() - t0;
   const heads = slice.slice(0, 8).map((s) => s.base).join(",");
-  const note = `${scannedCoins}/${tradeable.length} ${venue} perps · chart ${chartHostLabel(venue)} · ${tfs.join("/")}${scanIncomplete ? " · sweep continues next minute" : " · fresh close"} · ${heads}${slice.length > 8 ? "…" : ""}`;
+  const note = `${scannedCoins}/${tradeable.length} ${venue} perps · chart ${chartHostLabel(venue)} · ${tfs.join("/")}${scanIncomplete ? " · sweep continues next minute" : " · fresh close"} · ${heads}${slice.length > 8 ? "…" : ""}${liveBlock ? ` · ${liveBlock}` : ""}`;
   await logScan(scanned, signals, opened, closed, ms, note, opts.source);
 
   return {

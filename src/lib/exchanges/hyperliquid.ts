@@ -218,22 +218,10 @@ function flattenMessage(closed: PlaceOrderResult, why: string, orderId?: string)
   };
 }
 
-function triggerFromOpen(
-  hit: { idx: number; asset: MetaAsset },
-  o: HlOpenOrder,
-  fallbackQty: number,
-) {
-  const px = formatPrice(Number(o.triggerPx ?? 0), hit.asset.szDecimals);
-  const sz = formatSize(Number(o.sz ?? 0) || fallbackQty, hit.asset.szDecimals);
-  const tpsl = o.tpsl === "tp" ? ("tp" as const) : ("sl" as const);
-  return {
-    a: hit.idx,
-    b: o.side === "B",
-    p: px,
-    s: sz,
-    r: true,
-    t: { trigger: { isMarket: true, triggerPx: px, tpsl } },
-  };
+function pxClose(a: number, b: number) {
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  const scale = Math.max(Math.abs(b), Math.abs(a), 1e-9);
+  return Math.abs(a - b) / scale < 0.002;
 }
 
 export const hyperliquidAdapter: ExchangeAdapter = {
@@ -418,7 +406,8 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       const user = masterAddress(account);
       if (!user) return { ok: false, message: "Hyperliquid address missing" };
       const { exchange } = clients(account);
-      const existing = await listTriggers(account, hit.coin);
+      const coin = hit.coin;
+      const existing = await listTriggers(account, coin);
       const slPx = formatPrice(order.sl, hit.asset.szDecimals);
       const tpPx = formatPrice(order.tp, hit.asset.szDecimals);
       const sz = formatSize(order.qty, hit.asset.szDecimals);
@@ -456,9 +445,29 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       }
 
       const first = await placeFresh();
-      if (protectionLanded(first, 2)) {
-        const newOids = new Set(statusesOf(first).map(statusOid).filter(Boolean));
-        const stale = existing.filter((o) => !newOids.has(String(o.oid)));
+      async function venueHasNewPair() {
+        const opens = await listTriggers(account, coin);
+        const hasSl = opens.some((o) => o.tpsl === "sl" && pxClose(Number(o.triggerPx), order.sl));
+        const hasTp = opens.some((o) => o.tpsl === "tp" && pxClose(Number(o.triggerPx), order.tp));
+        return { opens, hasSl, hasTp };
+      }
+
+      let check = await venueHasNewPair();
+      if (!check.hasSl || !check.hasTp) {
+        await placeFresh();
+        check = await venueHasNewPair();
+      }
+      if (check.hasSl && check.hasTp) {
+        const keep = new Set(
+          check.opens
+            .filter(
+              (o) =>
+                (o.tpsl === "sl" && pxClose(Number(o.triggerPx), order.sl)) ||
+                (o.tpsl === "tp" && pxClose(Number(o.triggerPx), order.tp)),
+            )
+            .map((o) => String(o.oid)),
+        );
+        const stale = existing.filter((o) => o.oid != null && !keep.has(String(o.oid)));
         if (stale.length) {
           try {
             await cancelOids(
@@ -472,36 +481,11 @@ export const hyperliquidAdapter: ExchangeAdapter = {
         }
         return { ok: true, message: "Hyperliquid SL moved to BE · TP kept" };
       }
-
-      const snapshot = existing.filter((o) => Number(o.triggerPx) > 0);
-      if (snapshot.length) {
-        try {
-          await cancelOids(
-            account,
-            hit.idx,
-            snapshot.map((o) => Number(o.oid)),
-          );
-        } catch {
-          /* still try the replacement */
-        }
-      }
-      const second = await placeFresh();
-      if (protectionLanded(second, 2)) {
-        return { ok: true, message: "Hyperliquid SL moved to BE · TP kept" };
-      }
-      if (snapshot.length) {
-        try {
-          await exchange.order({
-            orders: snapshot.map((o) => triggerFromOpen(hit, o, order.qty)),
-            grouping: "positionTpsl",
-          });
-        } catch {
-          /* original may already be gone */
-        }
-      }
       return {
         ok: false,
-        message: allOrderErrors(second) || allOrderErrors(first) || "Hyperliquid BE stop did not confirm — original SL restored if possible",
+        message:
+          allOrderErrors(first) ||
+          "Hyperliquid BE stop did not confirm — original SL kept",
       };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Hyperliquid update stop failed" };
