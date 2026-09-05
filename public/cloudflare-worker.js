@@ -14,7 +14,8 @@
  * Cloudflare sometimes fires 1–2 minutes late — the desk only fills the
  * latest closed bar while it is still fresh, and continues the universe
  * sweep on the next ping. Never trades a forming candle or the previous one.
- * Add a free cron-job.org backup hitting the same /api/tick?token= URL.
+ * Add a free cron-job.org backup hitting the same /api/tick URL with
+ * Authorization: Bearer DESK_TOKEN (never put the token in the query string).
  */
 export default {
   async scheduled(_event, env, ctx) {
@@ -35,7 +36,7 @@ async function pingDesk(env, attempt = 0) {
   if (!base || !token) {
     return { ok: false, error: "DESK_URL and DESK_TOKEN must be set" };
   }
-  const url = `${base}/api/tick?token=${encodeURIComponent(token)}`;
+  const url = `${base}/api/tick`;
   try {
     const res = await fetch(url, {
       method: "GET",

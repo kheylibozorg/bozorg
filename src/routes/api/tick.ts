@@ -2,10 +2,8 @@ import { createFileRoute } from "@tanstack/react-router";
 import { getSettings } from "@/lib/server/desk.server";
 import { runTick } from "@/lib/server/tick.server";
 
-function bearerOrQuery(request: Request) {
-  const url = new URL(request.url);
+function cronToken(request: Request) {
   return (
-    url.searchParams.get("token") ??
     request.headers.get("x-cron-secret") ??
     request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ??
     ""
@@ -39,7 +37,7 @@ export const Route = createFileRoute("/api/tick")({
   server: {
     handlers: {
       GET: async ({ request }) => {
-        const token = bearerOrQuery(request);
+        const token = cronToken(request);
         const settings = await getSettings();
         if (!authorized(token, settings.tick_token)) {
           return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });
@@ -52,7 +50,7 @@ export const Route = createFileRoute("/api/tick")({
         return Response.json(result);
       },
       POST: async ({ request }) => {
-        const token = bearerOrQuery(request);
+        const token = cronToken(request);
         const settings = await getSettings();
         if (!authorized(token, settings.tick_token)) {
           return Response.json({ ok: false, error: "unauthorized" }, { status: 401 });

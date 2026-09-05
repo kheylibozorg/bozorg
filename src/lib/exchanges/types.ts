@@ -50,6 +50,13 @@ export type UpdateStopInput = {
   qty: number;
 };
 
+export type ProtectionSnapshot = {
+  onVenue: boolean;
+  hasSl: boolean;
+  hasTp: boolean;
+  unknown: boolean;
+};
+
 export type ListedMarket = {
   base: string;
   symbol: string;
@@ -73,5 +80,10 @@ export type ExchangeAdapter = {
   updateStop(account: ExchangeAccount, order: UpdateStopInput): Promise<PlaceOrderResult>;
   closePosition(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult>;
   fetchPositions(account: ExchangeAccount): Promise<PositionSnapshot[]>;
+  /** Re-read the live position and whether SL/TP are actually on the book. */
+  fetchProtection(
+    account: ExchangeAccount,
+    input: { symbol: string; sl: number; tp: number },
+  ): Promise<ProtectionSnapshot>;
   testConnection(account: ExchangeAccount): Promise<ConnectionTest>;
 };
