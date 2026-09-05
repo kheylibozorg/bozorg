@@ -122,33 +122,60 @@ function orderKind(o: ToobitOpen): "sl" | "tp" | null {
   return null;
 }
 
+function asRows(json: unknown): unknown[] | null {
+  if (Array.isArray(json)) return json;
+  if (json && typeof json === "object") {
+    const o = json as Record<string, unknown>;
+    if (Array.isArray(o.data)) return o.data;
+    if (Array.isArray(o.list)) return o.list;
+  }
+  return null;
+}
+
+type Protection = { size: number; hasSl: boolean; hasTp: boolean; sideLong: boolean; unknown: boolean };
+
 async function readProtection(
   account: { apiKey: string; apiSecret: string },
   symbol: string,
   sl: number,
   tp: number,
-): Promise<{ size: number; hasSl: boolean; hasTp: boolean; sideLong: boolean }> {
-  const [posRaw, openRaw] = await Promise.all([
-    signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", { symbol }).catch(() => []),
-    signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/openOrders", { symbol }).catch(() => []),
+): Promise<Protection> {
+  const [posRes, openRes] = await Promise.all([
+    signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", { symbol })
+      .then((json) => ({ ok: true as const, json }))
+      .catch(() => ({ ok: false as const, json: null })),
+    signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/openOrders", { symbol })
+      .then((json) => ({ ok: true as const, json }))
+      .catch(() => ({ ok: false as const, json: null })),
   ]);
-  const positions = (Array.isArray(posRaw) ? posRaw : []) as ToobitPos[];
+  if (!posRes.ok) {
+    return { size: 0, hasSl: false, hasTp: false, sideLong: true, unknown: true };
+  }
+  const posRows = asRows(posRes.json);
+  if (!posRows) {
+    return { size: 0, hasSl: false, hasTp: false, sideLong: true, unknown: true };
+  }
+  const positions = posRows as ToobitPos[];
   const pos = positions.find((p) => Math.abs(Number(p.position ?? p.positionAmt ?? 0)) > 0);
   const size = Math.abs(Number(pos?.position ?? pos?.positionAmt ?? 0));
   const sideLabel = (pos?.side ?? "").toUpperCase();
   const sideLong = sideLabel === "LONG" || (sideLabel !== "SHORT" && Number(pos?.position ?? 0) > 0);
   let hasSl = pxClose(Number(pos?.stopLoss ?? pos?.sl ?? pos?.stopLossPrice ?? 0), sl);
   let hasTp = pxClose(Number(pos?.takeProfit ?? pos?.tp ?? pos?.takeProfitPrice ?? 0), tp);
-  const opens = (Array.isArray(openRaw) ? openRaw : []) as ToobitOpen[];
-  for (const o of opens) {
-    const k = orderKind(o);
-    const px = Number(o.stopPrice ?? o.price ?? 0);
-    if (k === "sl") hasSl = true;
-    else if (k === "tp") hasTp = true;
-    else if (pxClose(px, sl)) hasSl = true;
-    else if (pxClose(px, tp)) hasTp = true;
+  if (openRes.ok) {
+    const openRows = asRows(openRes.json);
+    if (openRows) {
+      for (const o of openRows as ToobitOpen[]) {
+        const k = orderKind(o);
+        const px = Number(o.stopPrice ?? o.price ?? 0);
+        if (k === "sl") hasSl = true;
+        else if (k === "tp") hasTp = true;
+        else if (pxClose(px, sl)) hasSl = true;
+        else if (pxClose(px, tp)) hasTp = true;
+      }
+    }
   }
-  return { size, hasSl, hasTp, sideLong };
+  return { size, hasSl, hasTp, sideLong, unknown: false };
 }
 
 function flattenMessage(closed: PlaceOrderResult, why: string, orderId?: string): PlaceOrderResult {
@@ -162,6 +189,25 @@ function flattenMessage(closed: PlaceOrderResult, why: string, orderId?: string)
     orderId,
     message: `${why} — flatten failed (${closed.message})`,
   };
+}
+
+async function flattenUnconfirmed(
+  account: ExchangeAccount,
+  symbol: string,
+  why: string,
+  orderId?: string,
+): Promise<PlaceOrderResult> {
+  try {
+    const closed = await marketCloseToobit(account, symbol);
+    return flattenMessage(closed, why, orderId);
+  } catch (err) {
+    return {
+      ok: false,
+      liveOpen: true,
+      orderId,
+      message: `${why} — flatten failed (${err instanceof Error ? err.message : "close threw"})`,
+    };
+  }
 }
 
 async function attachStops(
@@ -184,10 +230,11 @@ async function attachStops(
 async function toobitPositionAmt(account: ExchangeAccount, symbol: string): Promise<number | null> {
   if (!account.apiKey || !account.apiSecret) return null;
   try {
-    const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
+    const json = await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
       symbol,
-    })) as Array<{ position?: string | number; positionAmt?: string | number }>;
-    const list = Array.isArray(rows) ? rows : [];
+    });
+    const list = asRows(json) as Array<{ position?: string | number; positionAmt?: string | number }> | null;
+    if (!list) return null;
     const row = list.find((r) => Number(r.position ?? r.positionAmt) !== 0) ?? list[0];
     if (!row) return 0;
     return Math.abs(Number(row.position ?? row.positionAmt ?? 0)) || 0;
@@ -212,9 +259,11 @@ async function marketCloseToobit(account: ExchangeAccount, symbol: string): Prom
   const amt = await toobitPositionAmt(account, symbol);
   if (amt == null) return { ok: false, message: "Toobit position read failed before close" };
   if (!amt) return { ok: true, message: "flat" };
-  const rows = (await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
+  const json = await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
     symbol,
-  })) as Array<{ position: string; side?: string }>;
+  });
+  const rows = asRows(json) as Array<{ position: string; side?: string }> | null;
+  if (!rows) return { ok: false, message: "Toobit position read failed before close" };
   const row = rows.find((r) => Number(r.position) !== 0) ?? rows[0];
   if (!row || Number(row.position) === 0) return { ok: true, message: "flat" };
   const sideLabel = (row.side ?? "").toUpperCase();
@@ -307,6 +356,7 @@ export const toobitAdapter: ExchangeAdapter = {
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     if (!account.apiKey || !account.apiSecret) return { ok: false, message: "Toobit API key missing" };
     const keys = { apiKey: account.apiKey, apiSecret: account.apiSecret };
+    let oid: string | undefined;
     try {
       const rows = await loadContracts();
       const spec = contractOf(rows, order.symbol);
@@ -328,7 +378,6 @@ export const toobitAdapter: ExchangeAdapter = {
         /* ignore */
       }
       const side = order.side === "long" ? "BUY_OPEN" : "SELL_OPEN";
-      let oid: string | undefined;
       try {
         const data = (await signed(keys.apiKey, keys.apiSecret, "POST", "/api/v1/futures/order", {
           symbol: order.symbol,
@@ -346,21 +395,37 @@ export const toobitAdapter: ExchangeAdapter = {
         })) as { orderId?: string | number };
         oid = data.orderId ? String(data.orderId) : undefined;
       } catch (err) {
-        const afterFail = await readProtection(keys, order.symbol, order.sl, order.tp).catch(() => ({
-          size: 0,
-          hasSl: false,
-          hasTp: false,
-          sideLong: order.side === "long",
-        }));
+        const afterFail = await readProtection(keys, order.symbol, order.sl, order.tp).catch(
+          (): Protection => ({
+            size: 0,
+            hasSl: false,
+            hasTp: false,
+            sideLong: order.side === "long",
+            unknown: true,
+          }),
+        );
+        if (afterFail.unknown) {
+          return flattenUnconfirmed(
+            account,
+            order.symbol,
+            `Toobit entry unconfirmed (${err instanceof Error ? err.message : "order failed"})`,
+          );
+        }
         if (afterFail.size <= 0) {
           return { ok: false, message: err instanceof Error ? err.message : "Toobit order failed" };
         }
       }
 
-      let prot = { size: 0, hasSl: false, hasTp: false, sideLong: order.side === "long" };
+      let lastGood: Protection | null = null;
+      let sawUnknown = false;
       for (let i = 0; i < 3; i++) {
         await sleep(350);
-        prot = await readProtection(keys, order.symbol, order.sl, order.tp);
+        const prot = await readProtection(keys, order.symbol, order.sl, order.tp);
+        if (prot.unknown) {
+          sawUnknown = true;
+          continue;
+        }
+        lastGood = prot;
         if (prot.hasSl && prot.hasTp) break;
         if (prot.size > 0 && i === 1) {
           try {
@@ -370,29 +435,36 @@ export const toobitAdapter: ExchangeAdapter = {
           }
         }
       }
-      if (prot.size <= 0) {
+      if (!lastGood) {
+        if (sawUnknown || oid) {
+          return flattenUnconfirmed(account, order.symbol, "Toobit fill unconfirmed (position read failed)", oid);
+        }
         return { ok: false, message: "Toobit IOC did not fill" };
       }
-      if (prot.hasSl && prot.hasTp) {
+      if (lastGood.size <= 0) {
+        if (sawUnknown) {
+          return flattenUnconfirmed(account, order.symbol, "Toobit fill unconfirmed (position read failed)", oid);
+        }
+        return { ok: false, message: "Toobit IOC did not fill" };
+      }
+      if (lastGood.hasSl && lastGood.hasTp) {
         return {
           ok: true,
           orderId: oid,
           message: `Toobit market ${order.side} ${contracts} ct · SL/TP on venue`,
         };
       }
-      const missing = [!prot.hasSl && "SL", !prot.hasTp && "TP"].filter(Boolean).join("+");
-      try {
-        const closed = await marketCloseToobit(account, order.symbol);
-        return flattenMessage(closed, `Toobit filled but ${missing} missing`, oid);
-      } catch (err) {
-        return {
-          ok: false,
-          liveOpen: true,
-          orderId: oid,
-          message: `Toobit filled but ${missing} missing — flatten failed (${err instanceof Error ? err.message : "close threw"})`,
-        };
-      }
+      const missing = [!lastGood.hasSl && "SL", !lastGood.hasTp && "TP"].filter(Boolean).join("+");
+      return flattenUnconfirmed(account, order.symbol, `Toobit filled but ${missing} missing`, oid);
     } catch (err) {
+      if (oid) {
+        return flattenUnconfirmed(
+          account,
+          order.symbol,
+          `Toobit entry unconfirmed (${err instanceof Error ? err.message : "order failed"})`,
+          oid,
+        );
+      }
       return { ok: false, message: err instanceof Error ? err.message : "Toobit order failed" };
     }
   },

@@ -7,14 +7,14 @@ export const CRON_STALE_MS = 90_000;
 
 /**
  * How long after a bar's close we still accept a fill.
- * Window must cover a full universe sweep at one cron ping per minute,
- * even when Vercel kills the function at ~10s (≈30–40 coins/tick).
+ * Window is the rest of the next bar of that TF so a 200-coin book can
+ * finish across 1-minute cron pings (Vercel ~10s/tick ≈ 30–40 coins).
  */
 export const FRESH_MS: Record<Timeframe, number> = {
   "5m": TF_MS["5m"] - 3_000,
   "15m": TF_MS["15m"] - 3_000,
-  "1h": 25 * 60_000,
-  "4h": 25 * 60_000,
+  "1h": TF_MS["1h"] - 3_000,
+  "4h": TF_MS["4h"] - 3_000,
 };
 
 export type ScanDone = Record<Timeframe, number>;
@@ -65,6 +65,19 @@ export function prefixCompleted(done: boolean[]): number {
   let n = 0;
   while (n < done.length && done[n]) n += 1;
   return n;
+}
+
+/** Round-robin items from several slices so a 5m wave cannot starve 1h/4h. */
+export function interleaveSlices<T>(slices: T[][]): T[] {
+  const out: T[] = [];
+  const max = Math.max(0, ...slices.map((s) => s.length));
+  for (let i = 0; i < max; i++) {
+    for (const s of slices) {
+      const x = s[i];
+      if (x !== undefined) out.push(x);
+    }
+  }
+  return out;
 }
 
 export function nextTfCursor(opts: {

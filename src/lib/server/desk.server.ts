@@ -164,6 +164,7 @@ async function ensureTickHardeningColumns(sql: Awaited<ReturnType<typeof getSql>
     "alter table desk_settings add column if not exists scan_cursors text not null default '{}'",
     "alter table desk_settings add column if not exists orphan_fills text not null default '[]'",
     "alter table desk_settings add column if not exists tick_lock_id text",
+    "alter table desk_settings add column if not exists tick_lock_at timestamptz",
   ];
   for (const ddl of stmts) {
     try {
@@ -584,10 +585,17 @@ export async function alreadyFilled(opts: {
   }
 }
 
+export function tickLockStaleMs() {
+  // Must outlive a still-running tick (heartbeat miss) but expire before the next minute cron.
+  if (process.env.VERCEL) return 20_000;
+  return 55_000;
+}
+
 export async function acquireTickLock() {
   const sql = await getSql();
   await ensureTickHardeningColumns(sql);
   const token = randomBytes(12).toString("hex");
+  const staleMs = tickLockStaleMs();
   try {
     const rows = await sql<{ id: number }>`
       update desk_settings
@@ -596,7 +604,7 @@ export async function acquireTickLock() {
         and (
           tick_lock_id is null
           or tick_lock_at is null
-          or tick_lock_at < now() - interval '20 seconds'
+          or tick_lock_at < now() - (${staleMs}::int * interval '1 millisecond')
         )
       returning id
     `;
@@ -610,17 +618,17 @@ export async function acquireTickLock() {
           update desk_settings
           set tick_lock_at = ${new Date().toISOString()}::timestamptz
           where id = 1
-            and (tick_lock_at is null or tick_lock_at < now() - interval '20 seconds')
+            and (tick_lock_at is null or tick_lock_at < now() - (${staleMs}::int * interval '1 millisecond'))
           returning id
         `;
         return rows[0] ? token : null;
       } catch (err2) {
         const msg2 = err2 instanceof Error ? err2.message : String(err2);
-        if (/tick_lock_at|does not exist/i.test(msg2)) return token;
+        if (/tick_lock_at|does not exist/i.test(msg2)) return null;
         throw err2;
       }
     }
-    if (/tick_lock_at|does not exist/i.test(msg)) return token;
+    if (/tick_lock_at|does not exist/i.test(msg)) return null;
     throw err;
   }
 }
@@ -653,11 +661,19 @@ export async function releaseTickLock(token: string) {
     try {
       await sql`
         update desk_settings
-        set tick_lock_at = null
+        set tick_lock_at = null, tick_lock_id = null
         where id = 1
       `;
     } catch {
-      /* lock column may be missing on a fresh paste-schema */
+      try {
+        await sql`
+          update desk_settings
+          set tick_lock_at = null
+          where id = 1
+        `;
+      } catch {
+        /* lock column may be missing on a fresh paste-schema */
+      }
     }
   }
 }

@@ -6,6 +6,7 @@ import { origStopPx, pathExcursion, pnlAt, sizePosition, walkPath } from "@/lib/
 import { HTF2_OF, HTF_OF, TF_MS, WARMUP, type KlineTf, type Timeframe, type VenueId } from "@/lib/engine/types";
 import {
   dueTimeframes,
+  interleaveSlices,
   isFreshSignal,
   latestClosedOpen,
   nextTfCursor,
@@ -48,10 +49,10 @@ import { trexBeAtR } from "@/lib/engine/trex";
 
 const SCAN_BARS = 360;
 const MIN_BARS = WARMUP + 12;
-const SCAN_CONCURRENCY = 12;
+const SCAN_CONCURRENCY = 16;
 const MAX_BATCH = 250;
 const UNIVERSE_TTL_MS = 30 * 60_000;
-const LOCK_HEARTBEAT_MS = 7_000;
+const LOCK_HEARTBEAT_MS = 5_000;
 
 export function tickBudgetMs() {
   const override = Number(process.env.TICK_BUDGET_MS);
@@ -238,14 +239,14 @@ export async function runTick(opts?: { forceUniverse?: boolean; batch?: number; 
   }, LOCK_HEARTBEAT_MS);
   hb.unref?.();
   try {
-    return await runTickBody({ ...opts, source, t0 });
+    return await runTickBody({ ...opts, source, t0, lock });
   } finally {
     clearInterval(hb);
     await releaseTickLock(lock);
   }
 }
 
-async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; source: string; t0: number }) {
+async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; source: string; t0: number; lock: string }) {
   const t0 = opts.t0;
   const settings = await getSettings();
   if (!settings.bot_enabled) {
@@ -626,15 +627,14 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   });
   const planned = new Map<string, Timeframe[]>();
   const slice: typeof tradeable = [];
-  for (const work of tfWork) {
-    for (const a of work.slice) {
-      const list = planned.get(a.symbol);
-      if (list) {
-        if (!list.includes(work.tf)) list.push(work.tf);
-      } else {
-        planned.set(a.symbol, [work.tf]);
-        slice.push(a);
-      }
+  const tagged = tfWork.map((w) => w.slice.map((a) => ({ a, tf: w.tf })));
+  for (const row of interleaveSlices(tagged)) {
+    const list = planned.get(row.a.symbol);
+    if (list) {
+      if (!list.includes(row.tf)) list.push(row.tf);
+    } else {
+      planned.set(row.a.symbol, [row.tf]);
+      slice.push(row.a);
     }
   }
 
@@ -659,6 +659,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const lastN = scanLastN(opts.source);
   const finished = new Set<string>();
 
+  if (Date.now() + 1_500 < deadline) {
   await mapPool(slice, SCAN_CONCURRENCY, async (asset) => {
     if (Date.now() > deadline) return;
     tried += 1;
@@ -672,19 +673,31 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     const loaded = new Map<KlineTf, Awaited<ReturnType<typeof fetchKlinesCached>>>();
     await Promise.all(
       [...need].map(async (tf) => {
-        try {
-          const limit = tf === "1d" || tf === "1w" ? 80 : SCAN_BARS;
-          loaded.set(tf, await fetchKlinesCached(asset.symbol, tf, limit, venue));
-        } catch {
-          loaded.set(tf, []);
+        const limit = tf === "1d" || tf === "1w" ? 80 : SCAN_BARS;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const bars = await fetchKlinesCached(asset.symbol, tf, limit, venue);
+            if (bars.length) {
+              loaded.set(tf, bars);
+              return;
+            }
+          } catch {
+            /* retry once — empty is not cached */
+          }
         }
+        loaded.set(tf, []);
       }),
     );
     let any = false;
+    const scannedTf = new Set<Timeframe>();
     for (const tf of tfsHere) {
       const raw = loaded.get(tf) ?? [];
       const closedBars = onlyClosedBars(raw, tf);
-      if (closedBars.length < MIN_BARS) continue;
+      if (closedBars.length < MIN_BARS) {
+        if (raw.length) scannedTf.add(tf);
+        continue;
+      }
+      scannedTf.add(tf);
       const htfTf = HTF_OF[tf];
       const htf2Tf = HTF2_OF[tf];
       const htfClosed = onlyClosedBars(loaded.get(htfTf) ?? [], htfTf);
@@ -718,16 +731,16 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       }
     }
     if (any) scannedCoins += 1;
-    } catch {
-      /* one coin must not abort the rest of the tick */
-    }
     finished.add(asset.symbol);
     for (const work of tfWork) {
       const idx = work.slice.findIndex((a) => a.symbol === asset.symbol);
-      if (idx >= 0) work.done[idx] = true;
+      if (idx >= 0 && scannedTf.has(work.tf)) work.done[idx] = true;
+    }
+    } catch {
+      /* timeout/kline throw: leave done=false so the next ping retries this coin */
     }
   });
-
+  }
   const scanIncomplete = Boolean(slice.length) && finished.size < slice.length;
   if (tradeable.length && slice.length) {
     const nextCursors: Record<string, TfCursor> = { ...cursors };
@@ -818,6 +831,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
           const ad = getAdapter(venue);
           if (!ad) skip = "no adapter";
           else if (!hasLiveKeys(settings, venue)) skip = `${venue} keys missing`;
+          else if (!(await heartbeatTickLock(opts.lock))) skip = "tick lock lost";
           else {
             try {
               const res = await ad.placeOrder(acc, {

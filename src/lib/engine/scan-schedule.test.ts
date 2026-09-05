@@ -5,6 +5,7 @@ import {
   FRESH_MS,
   dueTimeframes,
   emptyScanDone,
+  interleaveSlices,
   isFreshSignal,
   latestClosedOpen,
   nextTfCursor,
@@ -68,6 +69,11 @@ describe("dueTimeframes", () => {
   it("cron keeps sweeping 1h for 20 minutes so a 200-coin book can finish", () => {
     const close = Date.UTC(2026, 0, 1, 13, 0, 0);
     const tfs = dueTimeframes(close + 20 * 60_000, emptyScanDone(), "cloudflare");
+    assert.ok(tfs.includes("1h"));
+  });
+  it("cron still sweeps 1h near the next close so a slow book can finish", () => {
+    const close = Date.UTC(2026, 0, 1, 13, 0, 0);
+    const tfs = dueTimeframes(close + 50 * 60_000, emptyScanDone(), "cloudflare");
     assert.ok(tfs.includes("1h"));
   });
 });
@@ -143,5 +149,15 @@ describe("scanLastN / per-TF cursor", () => {
     assert.equal(got["5m"].c, 40);
     assert.equal(got["1h"].c, 12);
     assert.equal(got["15m"].c, 0);
+  });
+});
+
+describe("interleaveSlices", () => {
+  it("round-robins so the first TF cannot take every slot", () => {
+    const got = interleaveSlices([
+      ["a", "b", "c"],
+      ["x", "y"],
+    ]);
+    assert.deepEqual(got, ["a", "x", "b", "y", "c"]);
   });
 });
