@@ -4,7 +4,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { defaultMaxLeverage } from "@/lib/market/binance";
 import { coinOf, isTradeableBase, nativeSymbol } from "./meta";
 import { capLeverage } from "./lev-cap";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput } from "./types";
 
 const INFO_URL = "https://api.hyperliquid.xyz/info";
 
@@ -16,15 +16,20 @@ function normalizePk(raw: string): `0x${string}` {
   return (s.startsWith("0x") ? s : `0x${s}`) as `0x${string}`;
 }
 
+function triggerExecPx(trigger: number, closeBuy: boolean, szDec: number) {
+  const slip = closeBuy ? 1.02 : 0.98;
+  return formatPrice(trigger * slip, szDec);
+}
+
+function masterWalletOk(account: ExchangeAccount) {
+  const w = account.walletAddress?.trim() ?? "";
+  return /^0x[0-9a-fA-F]{40}$/.test(w);
+}
+
 function masterAddress(account: ExchangeAccount): `0x${string}` | null {
   const w = account.walletAddress?.trim();
   if (w && /^0x[0-9a-fA-F]{40}$/.test(w)) return w.toLowerCase() as `0x${string}`;
-  if (!account.privateKey) return null;
-  try {
-    return privateKeyToAccount(normalizePk(account.privateKey)).address;
-  } catch {
-    return null;
-  }
+  return null;
 }
 
 async function info<T>(body: unknown): Promise<T> {
@@ -363,6 +368,9 @@ export const hyperliquidAdapter: ExchangeAdapter = {
   async placeOrder(account, order: PlaceOrderInput): Promise<PlaceOrderResult> {
     try {
       if (!account.privateKey) return { ok: false, message: "Hyperliquid private key missing" };
+      if (!masterWalletOk(account)) {
+        return { ok: false, message: "Master wallet 0x address required. Agent keys cannot be armed without it." };
+      }
       const { meta, mids } = await loadMeta();
       const hit = assetOf(meta, order.symbol);
       if (!hit) return { ok: false, message: `Hyperliquid has no market for ${order.symbol}` };
@@ -386,6 +394,9 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       }
       const slPx = formatPrice(order.sl, szDec);
       const tpPx = formatPrice(order.tp, szDec);
+      const closeBuy = !isBuy;
+      const slExec = triggerExecPx(order.sl, closeBuy, szDec);
+      const tpExec = triggerExecPx(order.tp, closeBuy, szDec);
       const entry = {
         a: hit.idx,
         b: isBuy,
@@ -396,16 +407,16 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       };
       const sl = {
         a: hit.idx,
-        b: !isBuy,
-        p: slPx,
+        b: closeBuy,
+        p: slExec,
         s: sz,
         r: true,
         t: { trigger: { isMarket: true, triggerPx: slPx, tpsl: "sl" as const } },
       };
       const tp = {
         a: hit.idx,
-        b: !isBuy,
-        p: tpPx,
+        b: closeBuy,
+        p: tpExec,
         s: sz,
         r: true,
         t: { trigger: { isMarket: true, triggerPx: tpPx, tpsl: "tp" as const } },
@@ -425,6 +436,22 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       }
 
       async function protectOrFlatten(entryResult: unknown, why: string): Promise<PlaceOrderResult> {
+        let filled = entryLive(entryResult);
+        if (!filled) {
+          try {
+            filled = (await coinPositionSize(account, market.coin)) > 0;
+          } catch {
+            filled = false;
+          }
+        }
+        if (!filled) {
+          try {
+            await closeAndDisarm(account, order.symbol);
+          } catch {
+            /* leftover triggers optional if never filled */
+          }
+          return { ok: false, message: why };
+        }
         const protect = await place({ orders: [sl, tp], grouping: "positionTpsl" });
         if (protectionLanded(protect, 2)) {
           return {
@@ -479,11 +506,13 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       const tpPx = formatPrice(order.tp, hit.asset.szDecimals);
       const sz = formatSize(order.qty, hit.asset.szDecimals);
       const closeBuy = order.side === "short";
+      const slExec = triggerExecPx(order.sl, closeBuy, hit.asset.szDecimals);
+      const tpExec = triggerExecPx(order.tp, closeBuy, hit.asset.szDecimals);
       const fresh = [
         {
           a: hit.idx,
           b: closeBuy,
-          p: slPx,
+          p: slExec,
           s: sz,
           r: true,
           t: { trigger: { isMarket: true, triggerPx: slPx, tpsl: "sl" as const } },
@@ -491,7 +520,7 @@ export const hyperliquidAdapter: ExchangeAdapter = {
         {
           a: hit.idx,
           b: closeBuy,
-          p: tpPx,
+          p: tpExec,
           s: sz,
           r: true,
           t: { trigger: { isMarket: true, triggerPx: tpPx, tpsl: "tp" as const } },
@@ -593,6 +622,27 @@ export const hyperliquidAdapter: ExchangeAdapter = {
         };
       });
   },
+  async fetchProtection(account, input): Promise<ProtectionSnapshot> {
+    const user = masterAddress(account);
+    if (!user) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    const { meta } = await loadMeta();
+    const hit = assetOf(meta, input.symbol);
+    if (!hit) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    let onVenue = false;
+    try {
+      onVenue = (await coinPositionSize(account, hit.coin)) > 0;
+    } catch {
+      return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    }
+    try {
+      const opens = await listTriggers(account, hit.coin);
+      const hasSl = opens.some((o) => o.tpsl === "sl");
+      const hasTp = opens.some((o) => o.tpsl === "tp");
+      return { onVenue, hasSl, hasTp, unknown: false };
+    } catch {
+      return { onVenue, hasSl: false, hasTp: false, unknown: true };
+    }
+  },
   async testConnection(account) {
     try {
       if (!account.privateKey) return { ok: false, message: "Paste the agent (or main) private key." };
@@ -601,13 +651,17 @@ export const hyperliquidAdapter: ExchangeAdapter = {
       } catch {
         return { ok: false, message: "Private key is not a valid hex key." };
       }
+      if (!masterWalletOk(account)) {
+        return {
+          ok: false,
+          message: "Master wallet 0x address required. Agent keys cannot be armed without it.",
+        };
+      }
       const user = masterAddress(account);
       if (!user) return { ok: false, message: "Could not derive address." };
       const bal = await this.fetchBalance(account);
       const pos = await this.fetchPositions(account);
-      const agentNote = account.walletAddress
-        ? `master ${user.slice(0, 6)}…${user.slice(-4)}`
-        : `derived ${user.slice(0, 6)}…${user.slice(-4)} (paste master address if this is an agent key)`;
+      const agentNote = `master ${user.slice(0, 6)}…${user.slice(-4)}`;
       if (bal == null) return { ok: false, message: `Signed, but no clearinghouse state for ${agentNote}.` };
       return {
         ok: true,

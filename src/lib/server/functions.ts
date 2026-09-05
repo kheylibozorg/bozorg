@@ -27,7 +27,7 @@ import {
 } from "./desk.server";
 import { lockOperator, lockStatus, requireOperator, setOperatorPin, unlockOperator } from "./lock.server";
 import { bookVenue, getAdapter } from "@/lib/exchanges/registry";
-import { accountFrom, clearUniverseCache, hasLiveKeys, refreshUniverse, runTick } from "./tick.server";
+import { accountFrom, clearUniverseCache, refreshUniverse, runTick } from "./tick.server";
 
 export const getDesk = createServerFn({ method: "GET" }).handler(async () => {
   await maybeSeedJournal();
@@ -150,29 +150,12 @@ export const saveDeskSettings = createServerFn({ method: "POST" })
               ? "toobit"
               : undefined;
     if (inferred) patch.venue = inferred;
-    const venue = (patch.venue ?? before.venue) as VenueId;
-    const merged = {
-      ...before,
-      hyperliquid_private_key: patch.hyperliquid_private_key ?? before.hyperliquid_private_key,
-      lighter_api_private_key: patch.lighter_api_private_key ?? before.lighter_api_private_key,
-      lighter_account_index: patch.lighter_account_index ?? before.lighter_account_index,
-      aster_api_key: patch.aster_api_key ?? before.aster_api_key,
-      aster_api_secret: patch.aster_api_secret ?? before.aster_api_secret,
-      toobit_api_key: patch.toobit_api_key ?? before.toobit_api_key,
-      toobit_api_secret: patch.toobit_api_secret ?? before.toobit_api_secret,
-    };
     const newKeys = Boolean(
       patch.hyperliquid_private_key ||
         patch.lighter_api_private_key ||
         (patch.aster_api_key && patch.aster_api_secret) ||
         (patch.toobit_api_key && patch.toobit_api_secret),
     );
-    const pickingLive = Boolean(inferred && inferred !== "paper");
-    if (venue !== "paper" && (newKeys || pickingLive) && patch.mode !== "paper" && hasLiveKeys(merged, venue)) {
-      patch.mode = patch.mode ?? "live";
-      patch.live_enabled = patch.live_enabled ?? 1;
-      patch.bot_enabled = patch.bot_enabled ?? 1;
-    }
     const row = await patchSettings(patch);
     const venueChanged = Boolean(patch.venue && patch.venue !== before.venue);
     const modeChanged = Boolean(patch.mode && patch.mode !== before.mode);
@@ -251,12 +234,9 @@ export const testVenue = createServerFn({ method: "POST" })
       try {
         await patchSettings({
           venue: data.venue,
-          mode: "live",
-          live_enabled: 1,
-          bot_enabled: 1,
         });
       } catch {
-        /* arming is best-effort; the ping itself succeeded */
+        /* venue switch is best-effort; the ping itself succeeded */
       }
       try {
         clearListedCache(data.venue as VenueId);

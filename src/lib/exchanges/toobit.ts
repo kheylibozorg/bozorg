@@ -3,7 +3,7 @@ import { signedQuery } from "./hmac";
 import { roundToStep } from "./qty";
 import { capLeverage } from "./lev-cap";
 import { listedFromToobitContracts, listedFromToobitTickers } from "./toobit-listed";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput } from "./types";
 
 const BASE = "https://api.toobit.com";
 
@@ -562,6 +562,19 @@ export const toobitAdapter: ExchangeAdapter = {
           upl: Number(r.unrealisedPnl ?? 0),
         };
       });
+  },
+  async fetchProtection(account, input): Promise<ProtectionSnapshot> {
+    if (!account.apiKey || !account.apiSecret) {
+      return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    }
+    const prot = await readProtection(
+      { apiKey: account.apiKey, apiSecret: account.apiSecret },
+      input.symbol,
+      input.sl,
+      input.tp,
+    );
+    if (prot.unknown) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    return { onVenue: prot.size > 0, hasSl: prot.hasSl, hasTp: prot.hasTp, unknown: false };
   },
   async testConnection(account) {
     try {

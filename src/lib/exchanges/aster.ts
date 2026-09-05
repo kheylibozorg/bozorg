@@ -3,7 +3,7 @@ import { roundToStep } from "./qty";
 import { capLeverage } from "./lev-cap";
 import { venueMaxLeverage } from "./leverage";
 import { isTradeableBase, nativeSymbol } from "./meta";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput } from "./types";
 
 const BASE = "https://fapi.asterdex.com";
 
@@ -456,6 +456,27 @@ export const asterAdapter: ExchangeAdapter = {
         leverage: Number(r.leverage),
         upl: Number(r.unRealizedProfit),
       }));
+  },
+  async fetchProtection(account, input): Promise<ProtectionSnapshot> {
+    const amt = await asterPositionAmt(account, input.symbol);
+    if (amt == null) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    const onVenue = amt !== 0;
+    try {
+      const opens = (await signed(account, "GET", "/fapi/v1/openOrders", { symbol: input.symbol })) as Array<{
+        type?: string;
+        origType?: string;
+      }>;
+      let hasSl = false;
+      let hasTp = false;
+      for (const o of opens) {
+        const typ = `${o.type ?? ""} ${o.origType ?? ""}`.toUpperCase();
+        if (typ.includes("TAKE_PROFIT")) hasTp = true;
+        else if (isStopType(o.type ?? "", o.origType ?? "")) hasSl = true;
+      }
+      return { onVenue, hasSl, hasTp, unknown: false };
+    } catch {
+      return { onVenue, hasSl: false, hasTp: false, unknown: true };
+    }
   },
   async testConnection(account) {
     try {

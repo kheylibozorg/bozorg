@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { defaultMaxLeverage } from "@/lib/market/binance";
 import { coinOf, isTradeableBase, nativeSymbol } from "./meta";
 import { capLeverage } from "./lev-cap";
-import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, UpdateStopInput } from "./types";
+import type { ExchangeAdapter, ExchangeAccount, ListedMarket, PlaceOrderInput, PlaceOrderResult, ProtectionSnapshot, UpdateStopInput } from "./types";
 
 const BASE = "https://mainnet.zklighter.elliot.ai";
 
@@ -121,16 +121,16 @@ type ActiveOrder = {
   marketIndex?: number;
 };
 
-/** Best-effort snapshot of live order indexes on one market. Empty if the public read fails. */
-async function listActiveOrderIndexes(account: ExchangeAccount, marketIndex: number): Promise<number[]> {
-  if (account.accountIndex == null) return [];
+/** Snapshot of live order indexes on one market. null if the public read fails. */
+async function listActiveOrderIndexes(account: ExchangeAccount, marketIndex: number): Promise<number[] | null> {
+  if (account.accountIndex == null) return null;
   try {
     const q = new URLSearchParams({
       account_index: String(account.accountIndex),
       market_id: String(marketIndex),
     });
     const res = await fetch(`${BASE}/api/v1/accountActiveOrders?${q}`);
-    if (!res.ok) return [];
+    if (!res.ok) return null;
     const json = (await res.json()) as { orders?: ActiveOrder[] } | ActiveOrder[];
     const orders = Array.isArray(json) ? json : json.orders ?? [];
     const ids: number[] = [];
@@ -142,7 +142,7 @@ async function listActiveOrderIndexes(account: ExchangeAccount, marketIndex: num
     }
     return ids;
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -350,6 +350,72 @@ export const lighterAdapter: ExchangeAdapter = {
         }
         return otoco.hash;
       });
+      let pos: { qty: number } | undefined;
+      let readFailed = false;
+      for (let i = 0; i < 4; i++) {
+        if (i) await new Promise((r) => setTimeout(r, 350));
+        try {
+          pos = (await this.fetchPositions(account)).find((p) => coinOf(p.symbol) === mkt.coin);
+          readFailed = false;
+          if (pos?.qty) break;
+        } catch {
+          readFailed = true;
+        }
+      }
+      if (readFailed && !pos?.qty) {
+        try {
+          const closed = await this.closePosition(account, order.symbol);
+          const flat = closed.ok || closed.message === "flat";
+          if (flat) return { ok: false, orderId: hash, message: "Lighter fill unconfirmed — flattened, no unprotected position left" };
+          return {
+            ok: false,
+            liveOpen: true,
+            orderId: hash,
+            message: `Lighter fill unconfirmed — flatten failed (${closed.message})`,
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            liveOpen: true,
+            orderId: hash,
+            message: `Lighter fill unconfirmed — flatten failed (${err instanceof Error ? err.message : "close threw"})`,
+          };
+        }
+      }
+      if (!pos?.qty) {
+        return { ok: false, orderId: hash, message: "Lighter OTOCO did not fill" };
+      }
+      let prot: ProtectionSnapshot = { onVenue: true, hasSl: false, hasTp: false, unknown: true };
+      for (let i = 0; i < 3; i++) {
+        prot = await this.fetchProtection(account, { symbol: order.symbol, sl: order.sl, tp: order.tp });
+        if (!prot.unknown && prot.hasSl && prot.hasTp) break;
+        if (i < 2) await new Promise((r) => setTimeout(r, 350));
+      }
+      if (prot.unknown || !prot.hasSl || !prot.hasTp) {
+        const missing = prot.unknown
+          ? "SL/TP unconfirmed"
+          : [!prot.hasSl && "SL", !prot.hasTp && "TP"].filter(Boolean).join("+") + " missing";
+        try {
+          const closed = await this.closePosition(account, order.symbol);
+          const flat = closed.ok || closed.message === "flat";
+          if (flat) {
+            return { ok: false, orderId: hash, message: `Lighter filled but ${missing} — flattened, no unprotected position left` };
+          }
+          return {
+            ok: false,
+            liveOpen: true,
+            orderId: hash,
+            message: `Lighter filled but ${missing} — flatten failed (${closed.message})`,
+          };
+        } catch (err) {
+          return {
+            ok: false,
+            liveOpen: true,
+            orderId: hash,
+            message: `Lighter filled but ${missing} — flatten failed (${err instanceof Error ? err.message : "close threw"})`,
+          };
+        }
+      }
       return { ok: true, orderId: hash, message: `Lighter ${order.side} ${mkt.coin} · SL/TP on venue` };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "Lighter order failed" };
@@ -364,7 +430,7 @@ export const lighterAdapter: ExchangeAdapter = {
       const sl = scale(order.sl, mkt.priceDecimals);
       const tp = scale(order.tp, mkt.priceDecimals);
       const isAsk = order.side === "long";
-      const oldIndexes = await listActiveOrderIndexes(account, mkt.marketIndex);
+      const oldIndexes = (await listActiveOrderIndexes(account, mkt.marketIndex)) ?? [];
       const hash = await withSigner(account, async (client) => {
         const oco = await client.createOcoOrder({
           orders: [
@@ -459,6 +525,46 @@ export const lighterAdapter: ExchangeAdapter = {
           message: "Lighter close left a remainder — SL/TP left in place",
         };
       }
+      const leftovers = (await listActiveOrderIndexes(account, mkt.marketIndex)) ?? [];
+      let others = 0;
+      try {
+        others = (await this.fetchPositions(account)).filter((p) => coinOf(p.symbol) !== mkt.coin && p.qty).length;
+      } catch {
+        others = 1;
+      }
+      try {
+        await withSigner(account, async (client) => {
+          if (others === 0) {
+            const result = await client.cancelAllOrders(0, Date.now());
+            const err = Array.isArray(result) ? result[result.length - 1] : null;
+            if (typeof err === "string" && err) throw new Error(err);
+            return;
+          }
+          for (const orderIndex of leftovers) {
+            try {
+              await client.cancelOrder({ marketIndex: mkt.marketIndex, orderIndex });
+            } catch {
+              /* leftover reduce-only is optional once flat */
+            }
+          }
+        });
+      } catch {
+        if (leftovers.length) {
+          try {
+            await withSigner(account, async (client) => {
+              for (const orderIndex of leftovers) {
+                try {
+                  await client.cancelOrder({ marketIndex: mkt.marketIndex, orderIndex });
+                } catch {
+                  /* leftover reduce-only is optional once flat */
+                }
+              }
+            });
+          } catch {
+            /* leftover reduce-only is optional once flat */
+          }
+        }
+      }
       return { ok: true, orderId: hash, message: "closed" };
     } catch (err) {
       return { ok: false, message: err instanceof Error ? err.message : "close failed" };
@@ -478,6 +584,26 @@ export const lighterAdapter: ExchangeAdapter = {
         leverage: Number(p.leverage ?? 1),
         upl: Number(p.unrealized_pnl ?? 0),
       }));
+  },
+  async fetchProtection(account, input): Promise<ProtectionSnapshot> {
+    const markets = await fetchLighterMarkets();
+    const mkt = marketOf(markets, input.symbol);
+    if (!mkt) return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    let onVenue = false;
+    try {
+      const pos = (await this.fetchPositions(account)).find((p) => coinOf(p.symbol) === mkt.coin);
+      onVenue = Boolean(pos?.qty);
+    } catch {
+      return { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    }
+    const indexes = await listActiveOrderIndexes(account, mkt.marketIndex);
+    if (indexes == null) return { onVenue, hasSl: false, hasTp: false, unknown: true };
+    return {
+      onVenue,
+      hasSl: indexes.length >= 2,
+      hasTp: indexes.length >= 2,
+      unknown: false,
+    };
   },
   async testConnection(account) {
     try {

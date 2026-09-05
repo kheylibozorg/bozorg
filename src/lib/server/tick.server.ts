@@ -18,7 +18,7 @@ import {
 import { bookVenue, chartHostLabel, getAdapter, resolveMaxLeverage, sameCoin, venueSymbol } from "@/lib/exchanges/registry";
 import { venueMaxLeverage, loadPublicLeverageMaps } from "@/lib/exchanges/leverage";
 import { capLeverage } from "@/lib/exchanges/lev-cap";
-import type { ExchangeAccount } from "@/lib/exchanges/types";
+import type { ExchangeAccount, ExchangeAdapter, PlaceOrderResult, ProtectionSnapshot } from "@/lib/exchanges/types";
 import {
   alreadyFilled,
   acquireTickLock,
@@ -73,7 +73,10 @@ export function clearUniverseCache() {
 }
 
 export function hasLiveKeys(s: SettingsRow, venue: VenueId) {
-  if (venue === "hyperliquid") return Boolean(s.hyperliquid_private_key);
+  if (venue === "hyperliquid") {
+    const w = (s.hyperliquid_wallet_address ?? "").trim();
+    return Boolean(s.hyperliquid_private_key) && /^0x[0-9a-fA-F]{40}$/.test(w);
+  }
   if (venue === "lighter") return Boolean(s.lighter_api_private_key && s.lighter_account_index != null);
   if (venue === "aster") return Boolean(s.aster_api_key && s.aster_api_secret);
   if (venue === "toobit") return Boolean(s.toobit_api_key && s.toobit_api_secret);
@@ -104,6 +107,51 @@ export function accountFrom(s: SettingsRow, venue: VenueId): ExchangeAccount {
 }
 
 const ORPHAN_MARK = "UNPROTECTED flatten failed";
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function confirmLiveFill(
+  adapter: ExchangeAdapter,
+  acc: ExchangeAccount,
+  symbol: string,
+  sl: number,
+  tp: number,
+  orderId?: string,
+): Promise<PlaceOrderResult> {
+  let last: ProtectionSnapshot = { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+  for (let i = 0; i < 5; i++) {
+    try {
+      last = await adapter.fetchProtection(acc, { symbol, sl, tp });
+      if (!last.unknown && last.onVenue && last.hasSl && last.hasTp) {
+        return { ok: true, orderId, message: "fill confirmed · SL/TP on venue" };
+      }
+      if (!last.unknown && !last.onVenue) break;
+    } catch {
+      last = { onVenue: false, hasSl: false, hasTp: false, unknown: true };
+    }
+    if (i < 4) await sleep(400);
+  }
+  const why = last.unknown
+    ? "live fill unconfirmed (venue read failed)"
+    : !last.onVenue
+      ? "live fill not on venue"
+      : `live fill missing ${[!last.hasSl && "SL", !last.hasTp && "TP"].filter(Boolean).join("+")}`;
+  try {
+    const closed = await adapter.closePosition(acc, symbol);
+    const flat = closed.ok || closed.message === "flat";
+    if (flat) return { ok: false, orderId, message: `${why} — flattened, no unprotected position left` };
+    return { ok: false, liveOpen: true, orderId, message: `${why} — flatten failed (${closed.message})` };
+  } catch (e) {
+    return {
+      ok: false,
+      liveOpen: true,
+      orderId,
+      message: `${why} — flatten failed (${e instanceof Error ? e.message : "close threw"})`,
+    };
+  }
+}
 
 function isOrphanPosition(pos: { signal_reason?: string | null }) {
   return typeof pos.signal_reason === "string" && pos.signal_reason.includes(ORPHAN_MARK);
@@ -311,16 +359,24 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const liveBlock = wantLive && !live
     ? !hasLiveKeys(settings, venue)
       ? `${venue} keys incomplete — live blocked, not opening paper`
-      : `live not armed (Test ${venue} first) — not opening paper`
+      : `live not armed — not opening paper`
     : "";
   const acc = accountFrom(settings, venue === "paper" ? "lighter" : venue);
   const adapter = live ? getAdapter(venue) : null;
+  let liveBalReady = !live;
+  let liveBookReady = !live;
   if (live && adapter) {
     try {
       const bal = await adapter.fetchBalance(acc);
-      if (bal != null && bal > 0) equity = bal;
+      if (bal != null && Number.isFinite(bal)) {
+        equity = bal;
+        liveBalReady = true;
+      }
     } catch {
-      /* keep desk equity */
+      liveBalReady = false;
+    }
+    if (!liveBalReady) {
+      equity = 0;
     }
     try {
       const pending = await listOrphanFills();
@@ -408,37 +464,102 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       }
     }
     if (live && adapter && pos.mode === "live") {
+      const vs = venueSymbol(venue, pos.symbol);
+      const side = pos.side as "long" | "short";
+      const slNow = Number(pos.sl);
+      const tpNow = Number(pos.tp);
+      const qtyNow = Number(pos.qty);
+      let skipBe = false;
+      try {
+        const prot = await adapter.fetchProtection(acc, { symbol: vs, sl: slNow, tp: tpNow });
+        if (!prot.unknown && !prot.onVenue) {
+          skipBe = true;
+        } else if (!prot.unknown && prot.onVenue && (!prot.hasSl || !prot.hasTp)) {
+          let restored = false;
+          try {
+            const placed = await adapter.updateStop(acc, {
+              symbol: vs,
+              side,
+              sl: slNow,
+              tp: tpNow,
+              qty: qtyNow,
+            });
+            if (placed.ok) {
+              const again = await adapter.fetchProtection(acc, { symbol: vs, sl: slNow, tp: tpNow });
+              restored = !again.unknown && again.hasSl && again.hasTp;
+            }
+          } catch {
+            restored = false;
+          }
+          if (!restored) {
+            const res = await adapter.closePosition(acc, vs);
+            if (res.ok || res.message === "flat") {
+              let exitPx = Number(pos.entry);
+              try {
+                const last = await fetchVenueLastPrice(venue, pos.symbol);
+                if (Number.isFinite(last)) exitPx = last;
+              } catch {
+                /* keep entry */
+              }
+              const origPx = origStopPx({
+                side,
+                entry: Number(pos.entry),
+                sl: slNow,
+                origSl: pos.orig_sl,
+                qty: pos.qty,
+                risk: pos.risk_usd,
+              });
+              const pnl = pnlAt(side, Number(pos.entry), exitPx, qtyNow, Number(pos.fees_usd));
+              const slDist = Math.abs(Number(pos.entry) - origPx);
+              const pnlR =
+                slDist > 0
+                  ? (side === "long" ? exitPx - Number(pos.entry) : Number(pos.entry) - exitPx) / slDist
+                  : 0;
+              const holdMs = Math.max(0, Date.now() - new Date(pos.opened_at).getTime());
+              await closePosition(pos.id, exitPx, "unprotected", pnl, pnlR, { holdMs, beMoved: false });
+              equity += pnl;
+              await bumpEquity(pnl);
+              closed += 1;
+              continue;
+            }
+            skipBe = true;
+          }
+        }
+      } catch {
+        /* next tick retries protection */
+      }
+      if (!skipBe) {
       const bars = lastBars.get(pos.symbol);
       const last = bars?.[bars.length - 1];
       const beAtR = trexBeAtR(pos.indicator);
       if (last && beAtR) {
-        const side = pos.side as "long" | "short";
         const entry = Number(pos.entry);
         const origPx = origStopPx({
           side,
           entry,
-          sl: Number(pos.sl),
+          sl: slNow,
           origSl: pos.orig_sl,
           qty: pos.qty,
           risk: pos.risk_usd,
         });
         const dist = Math.abs(entry - origPx);
-        const alreadyBe = Math.abs(Number(pos.sl) - entry) <= 1e-8 * Math.max(1, entry);
+        const alreadyBe = Math.abs(slNow - entry) <= 1e-8 * Math.max(1, entry);
         const fav = side === "long" ? last.close - entry : entry - last.close;
         if (!alreadyBe && dist > 0 && fav >= beAtR * dist) {
           try {
             const res = await adapter.updateStop(acc, {
-              symbol: venueSymbol(venue, pos.symbol),
+              symbol: vs,
               side,
               sl: entry,
-              tp: Number(pos.tp),
-              qty: Number(pos.qty),
+              tp: tpNow,
+              qty: qtyNow,
             });
             if (res.ok) await updatePositionSl(pos.id, entry);
           } catch {
             /* keep original stop on desk and venue */
           }
         }
+      }
       }
       continue;
     }
@@ -533,6 +654,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
     try {
       const exPos = await adapter.fetchPositions(acc);
       venueBook = exPos;
+      liveBookReady = true;
       const still = await listOpenPositions();
       for (const pos of still) {
         if (pos.mode !== "live") continue;
@@ -569,6 +691,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
         closed += 1;
       }
     } catch {
+      liveBookReady = false;
       /* venue read failed — keep desk rows, do not treat as all-flat */
     }
   }
@@ -656,7 +779,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   const deadline = t0 + tickBudgetMs();
   let scannedCoins = 0;
   let tried = 0;
-  const lastN = scanLastN(opts.source);
+  const lastN = live ? 1 : scanLastN(opts.source);
   const finished = new Set<string>();
 
   if (Date.now() + 1_500 < deadline) {
@@ -790,7 +913,7 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
   for (const s of found) {
     let taken = false;
     let skip = "";
-    const stale = opts.source !== "manual" && !isFreshSignal(s.barTime, s.timeframe, Date.now());
+    const stale = (live || opts.source !== "manual") && !isFreshSignal(s.barTime, s.timeframe, Date.now());
     if (stale) skip = "stale bar";
     else if (held.has(s.symbol)) skip = "already in symbol";
     else if (
@@ -799,6 +922,10 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
       venueBook.some((p) => sameCoin(p.symbol, s.symbol) || sameCoin(p.symbol, venueSymbol(venue, s.symbol)))
     )
       skip = "already on venue";
+    else if (live && (!liveBalReady || !liveBookReady))
+      skip = !liveBalReady
+        ? "live balance unread — not sending"
+        : "live positions unread — not sending";
     else if (used >= remainingSlots) skip = "max positions";
     else if (
       await alreadyFilled({
@@ -842,18 +969,52 @@ async function runTickBody(opts: { forceUniverse?: boolean; batch?: number; sour
                 sl: s.sl,
                 tp: s.tp,
               });
-              if (res.ok) {
-                orderId = res.orderId;
+              let final = res;
+              if (res.ok || res.liveOpen || res.orderId) {
+                if (res.ok || (!res.liveOpen && res.orderId)) {
+                  final = await confirmLiveFill(
+                    ad,
+                    acc,
+                    venueSymbol(venue, s.symbol),
+                    s.sl,
+                    s.tp,
+                    res.orderId,
+                  );
+                }
+              }
+              if (final.ok) {
+                orderId = final.orderId ?? res.orderId;
                 placedLive = true;
-              } else if (res.liveOpen) {
-                orderId = res.orderId;
+              } else if (final.liveOpen) {
+                orderId = final.orderId ?? res.orderId;
                 placedLive = true;
                 orphan = true;
               } else {
-                skip = res.message;
+                skip = final.message;
               }
             } catch (e) {
               skip = e instanceof Error ? e.message : "order threw";
+              try {
+                const vs = venueSymbol(venue, s.symbol);
+                const prot = await ad.fetchProtection(acc, { symbol: vs, sl: s.sl, tp: s.tp });
+                if (!prot.unknown && prot.onVenue) {
+                  const check = await confirmLiveFill(ad, acc, vs, s.sl, s.tp);
+                  if (check.ok) {
+                    orderId = check.orderId;
+                    placedLive = true;
+                    skip = "";
+                  } else if (check.liveOpen) {
+                    orderId = check.orderId;
+                    placedLive = true;
+                    orphan = true;
+                    skip = "";
+                  } else {
+                    skip = check.message;
+                  }
+                }
+              } catch {
+                /* keep skip; nothing confirmed on venue */
+              }
             }
           }
         }

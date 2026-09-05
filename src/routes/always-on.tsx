@@ -35,7 +35,7 @@ async function pingDesk(env, attempt) {
   const base = String(env.DESK_URL || "").replace(/\\/$/, "");
   const token = String(env.DESK_TOKEN || "");
   if (!base || !token) return { ok: false, error: "DESK_URL and DESK_TOKEN must be set" };
-  const url = base + "/api/tick?token=" + encodeURIComponent(token);
+  const url = base + "/api/tick";
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -212,8 +212,8 @@ DESK_URL = "${deskUrl}"
           </div>
           <p className="mt-2 text-xs leading-relaxed text-muted">
             {fa
-              ? "کاغذی بدون کلید ۲۴ساعته اسکن می‌شود. زنده: کلید را در صرافی‌ها Test کن تا مسلح شود. کرون خودش سفارش می‌فرستد."
-              : "Paper scans 24h with no keys. Live: Test keys on Venues to arm. Cron sends the order — no extra click."}
+              ? "کاغذی بدون کلید ۲۴ساعته اسکن می‌شود. زنده: کلید را Test کن، بعد Live را خودت روشن کن. کرون خودش سفارش می‌فرستد."
+              : "Paper scans 24h with no keys. Live: Test keys on Venues, then turn Live on yourself. Cron sends the order — no extra click."}
           </p>
         </div>
       </div>
@@ -296,16 +296,24 @@ DESK_URL = "${deskUrl}"
           <h2 className="mt-1 font-medium">{fa ? "پشتیبان رایگان اگر کلادفلر دیر کرد" : "Free backup if Cloudflare is late"}</h2>
           <p className="mt-1 text-sm text-muted">
             {fa
-              ? "برو cron-job.org (رایگان) → Create cronjob. هر ۱ دقیقه GET بزن به این آدرس. هدر x-cron-source را backup بگذار. این دومین تایمر است؛ با کلادفلر تداخل بد ندارد."
-              : "Go to cron-job.org (free) → Create cronjob. GET this URL every 1 minute. Set header x-cron-source = backup. Second timer; overlapping pings are ignored."}
+              ? "برو cron-job.org (رایگان) → Create cronjob. هر ۱ دقیقه GET بزن به این آدرس. هدر Authorization را Bearer توکن بگذار و x-cron-source را backup. توکن را در URL نگذار. این دومین تایمر است؛ با کلادفلر تداخل بد ندارد."
+              : "Go to cron-job.org (free) → Create cronjob. GET this URL every 1 minute. Set header Authorization = Bearer TOKEN and x-cron-source = backup. Never put the token in the URL. Second timer; overlapping pings are ignored."}
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <code className="block min-w-0 flex-1 overflow-x-auto rounded-sm bg-bg-elev p-3 font-mono text-xs">
-              {unlocked && token
-                ? `${deskUrl}/api/tick?token=${token}`
-                : `${deskUrl}/api/tick?token=${fa ? "—— قفل —— " : "—— locked ——"}`}
+              {`${deskUrl}/api/tick`}
             </code>
-            {unlocked && token ? <CopyBtn text={`${deskUrl}/api/tick?token=${token}`} label={fa ? "کپی URL" : "Copy URL"} /> : null}
+            <CopyBtn text={`${deskUrl}/api/tick`} label={fa ? "کپی URL" : "Copy URL"} />
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <code className="block min-w-0 flex-1 overflow-x-auto rounded-sm bg-bg-elev p-3 font-mono text-xs">
+              {unlocked && token
+                ? `Authorization: Bearer ${token}`
+                : `Authorization: Bearer ${fa ? "—— قفل —— " : "—— locked ——"}`}
+            </code>
+            {unlocked && token ? (
+              <CopyBtn text={`Bearer ${token}`} label={fa ? "کپی هدر" : "Copy header"} />
+            ) : null}
           </div>
         </li>
       </ol>

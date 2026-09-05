@@ -135,9 +135,6 @@ function Page() {
     try {
       const payload: {
         venue: "hyperliquid" | "lighter" | "aster" | "toobit";
-        mode: "live";
-        live_enabled: number;
-        bot_enabled: number;
         hyperliquid_private_key?: string;
         hyperliquid_wallet_address?: string;
         lighter_api_key?: string;
@@ -150,9 +147,6 @@ function Page() {
         toobit_api_secret?: string;
       } = {
         venue: id,
-        mode: "live",
-        live_enabled: 1,
-        bot_enabled: 1,
       };
       if (id === "hyperliquid") {
         if (hlPk) payload.hyperliquid_private_key = hlPk;
@@ -170,14 +164,11 @@ function Page() {
         if (toobitSec) payload.toobit_api_secret = toobitSec;
       }
       await saveDeskSettings({ data: payload });
-      setMode("live");
       setVenue(id);
-      setLive(true);
-      setBot(true);
       const res = await testVenue({ data: { venue: id } });
       setTestMsg((m) => ({ ...m, [id]: { ok: res.ok, text: res.message } }));
       if (res.ok) {
-        setMsg(fa ? "وصل شد · زنده مسلح است · کرون خودش معامله می‌فرستد" : "Connected · live armed · cron will send orders");
+        setMsg(fa ? "وصل شد · زنده را جداگانه از چک‌باکس Live روشن کن" : "Connected · turn Live on separately, then Save");
         if (id === "hyperliquid") {
           setHlPk("");
           setHlAddr("");
@@ -250,8 +241,8 @@ function Page() {
       {venue !== "paper" && mode === "live" ? (
         <p className="mt-4 rounded-lg border border-long/40 bg-long-dim/30 p-3 text-sm text-fg">
           {fa
-            ? "زنده: ورود مارکت است. TP و SL روی خود صرافی. کلید را بچسبان و Test بزن — اگر سبز شد همان لحظه مسلح می‌شود و کرون معامله می‌فرستد."
-            : "Live: market entry. TP/SL on the venue. Paste keys and hit Test — a green ping arms live and cron sends the orders."}
+            ? "زنده: ورود مارکت است. TP و SL روی خود صرافی. کلید را بچسبان و Test بزن. Test زنده را روشن نمی‌کند — Live و Save جدا هستند."
+            : "Live: market entry. TP/SL on the venue. Paste keys and hit Test. Test does not arm live — turn Live on and Save."}
         </p>
       ) : null}
 
@@ -399,7 +390,7 @@ function Page() {
               onChange={(e) => setHlPk(e.target.value)}
             />
             <Input
-              placeholder="Master wallet 0x… (required for agent keys)"
+              placeholder="Master wallet 0x… (required — agent keys cannot be armed without it)"
               value={hlAddr}
               onChange={(e) => setHlAddr(e.target.value)}
             />
@@ -493,8 +484,8 @@ function Page() {
       </div>
       <p className="mt-4 max-w-2xl text-xs text-subtle">
         {fa
-          ? "حداکثر اهرم را خودت می‌گذاری (۱ تا ۲۰۰). ربات از سقف خود ارز روی صرافی بالاتر نمی‌رود. درصد سرمایه مارجین است. کلید را Save یا Test کن تا زنده مسلح شود."
-          : "You set max leverage (1–200). The bot never exceeds that coin's venue max. Capital % is margin. Save or Test keys to arm live."}
+          ? "حداکثر اهرم را خودت می‌گذاری (۱ تا ۲۰۰). ربات از سقف خود ارز روی صرافی بالاتر نمی‌رود. درصد سرمایه مارجین است. کلید را Save کن؛ زنده فقط با چک‌باکس Live روشن می‌شود."
+          : "You set max leverage (1–200). The bot never exceeds that coin's venue max. Capital % is margin. Save keys; live only turns on from the Live checkbox."}
       </p>
     </DeskShell>
   );
