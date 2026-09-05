@@ -153,11 +153,52 @@ async function asterCancelOpen(account: ExchangeAccount, symbol: string) {
   }
 }
 
+/** Two successful zero reads. One zero can be API lag right after a fill. */
+async function confirmAsterAlreadyFlat(account: ExchangeAccount, symbol: string): Promise<"flat" | "open" | "unknown"> {
+  let zeros = 0;
+  for (let i = 0; i < 3; i++) {
+    const amt = await asterPositionAmt(account, symbol);
+    if (amt == null) {
+      zeros = 0;
+    } else if (!amt) {
+      zeros += 1;
+      if (zeros >= 2) return "flat";
+    } else {
+      return "open";
+    }
+    if (i < 2) await sleep(300);
+  }
+  return "unknown";
+}
+
 /** Close first. Never cancel SL/TP unless the position is confirmed flat. */
 async function closeAndDisarm(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   const closed = await asterMarketClose(account, symbol);
   if (!closed.ok && closed.message !== "flat") return closed;
   if (closed.message === "flat") {
+    const state = await confirmAsterAlreadyFlat(account, symbol);
+    if (state === "open") {
+      const again = await asterMarketClose(account, symbol);
+      if (!again.ok && again.message !== "flat") return again;
+      if (again.message === "flat") {
+        return { ok: false, message: "Aster close unconfirmed — SL/TP left in place" };
+      }
+      const after = await waitAsterFlat(account, symbol);
+      if (after !== "flat") {
+        return {
+          ok: false,
+          message:
+            after === "unknown"
+              ? "Aster close unconfirmed — SL/TP left in place"
+              : "Aster close left a remainder — SL/TP left in place",
+        };
+      }
+      await asterCancelOpen(account, symbol);
+      return { ok: true, orderId: again.orderId, message: "closed" };
+    }
+    if (state !== "flat") {
+      return { ok: false, message: "Aster close unconfirmed — SL/TP left in place" };
+    }
     await asterCancelOpen(account, symbol);
     return closed;
   }

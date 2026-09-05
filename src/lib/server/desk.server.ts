@@ -612,23 +612,7 @@ export async function acquireTickLock() {
     return null;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (/tick_lock_id|does not exist/i.test(msg)) {
-      try {
-        const rows = await sql<{ id: number }>`
-          update desk_settings
-          set tick_lock_at = ${new Date().toISOString()}::timestamptz
-          where id = 1
-            and (tick_lock_at is null or tick_lock_at < now() - (${staleMs}::int * interval '1 millisecond'))
-          returning id
-        `;
-        return rows[0] ? token : null;
-      } catch (err2) {
-        const msg2 = err2 instanceof Error ? err2.message : String(err2);
-        if (/tick_lock_at|does not exist/i.test(msg2)) return null;
-        throw err2;
-      }
-    }
-    if (/tick_lock_at|does not exist/i.test(msg)) return null;
+    if (/tick_lock_id|tick_lock_at|does not exist/i.test(msg)) return null;
     throw err;
   }
 }
@@ -650,6 +634,7 @@ export async function heartbeatTickLock(token: string) {
 }
 
 export async function releaseTickLock(token: string) {
+  if (!token) return;
   const sql = await getSql();
   try {
     await sql`
@@ -658,23 +643,7 @@ export async function releaseTickLock(token: string) {
       where id = 1 and tick_lock_id = ${token}
     `;
   } catch {
-    try {
-      await sql`
-        update desk_settings
-        set tick_lock_at = null, tick_lock_id = null
-        where id = 1
-      `;
-    } catch {
-      try {
-        await sql`
-          update desk_settings
-          set tick_lock_at = null
-          where id = 1
-        `;
-      } catch {
-        /* lock column may be missing on a fresh paste-schema */
-      }
-    }
+    /* never clear another tick's lock */
   }
 }
 

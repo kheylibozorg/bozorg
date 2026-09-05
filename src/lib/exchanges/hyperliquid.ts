@@ -165,6 +165,27 @@ async function waitHlFlat(account: ExchangeAccount, coin: string): Promise<"flat
   return last === 0 ? "flat" : "open";
 }
 
+/** Two successful zero reads. One zero can be API lag right after a fill. */
+async function confirmHlAlreadyFlat(account: ExchangeAccount, coin: string): Promise<"flat" | "open" | "unknown"> {
+  if (!masterAddress(account)) return "unknown";
+  let zeros = 0;
+  for (let i = 0; i < 3; i++) {
+    try {
+      const sz = await coinPositionSize(account, coin);
+      if (sz === 0) {
+        zeros += 1;
+        if (zeros >= 2) return "flat";
+      } else {
+        return "open";
+      }
+    } catch {
+      zeros = 0;
+    }
+    if (i < 2) await sleep(300);
+  }
+  return "unknown";
+}
+
 async function marketCloseHl(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   if (!account.privateKey) return { ok: false, message: "Hyperliquid private key missing" };
   const user = masterAddress(account);
@@ -211,15 +232,50 @@ async function closeAndDisarm(account: ExchangeAccount, symbol: string): Promise
   if (!hit) {
     return { ok: false, message: "Hyperliquid close unconfirmed — SL/TP left in place" };
   }
-  const state = closed.message === "flat" ? "flat" : await waitHlFlat(account, hit.coin);
-  if (state !== "flat") {
-    return {
-      ok: false,
-      message:
-        state === "unknown"
-          ? "Hyperliquid close unconfirmed — SL/TP left in place"
-          : "Hyperliquid close left a remainder — SL/TP left in place",
-    };
+  if (closed.message === "flat") {
+    const state = await confirmHlAlreadyFlat(account, hit.coin);
+    if (state === "open") {
+      const again = await marketCloseHl(account, symbol);
+      if (!again.ok && again.message !== "flat") return again;
+      if (again.message === "flat") {
+        return { ok: false, message: "Hyperliquid close unconfirmed — SL/TP left in place" };
+      }
+      const after = await waitHlFlat(account, hit.coin);
+      if (after !== "flat") {
+        return {
+          ok: false,
+          message:
+            after === "unknown"
+              ? "Hyperliquid close unconfirmed — SL/TP left in place"
+              : "Hyperliquid close left a remainder — SL/TP left in place",
+        };
+      }
+      try {
+        const leftover = await listTriggers(account, hit.coin);
+        await cancelOids(
+          account,
+          hit.idx,
+          leftover.map((o) => Number(o.oid)),
+        );
+      } catch {
+        /* leftover triggers are optional once flat */
+      }
+      return { ok: true, orderId: again.orderId, message: "closed" };
+    }
+    if (state !== "flat") {
+      return { ok: false, message: "Hyperliquid close unconfirmed — SL/TP left in place" };
+    }
+  } else {
+    const state = await waitHlFlat(account, hit.coin);
+    if (state !== "flat") {
+      return {
+        ok: false,
+        message:
+          state === "unknown"
+            ? "Hyperliquid close unconfirmed — SL/TP left in place"
+            : "Hyperliquid close left a remainder — SL/TP left in place",
+      };
+    }
   }
   try {
     const leftover = await listTriggers(account, hit.coin);

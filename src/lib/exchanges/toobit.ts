@@ -254,18 +254,46 @@ async function waitToobitFlat(account: ExchangeAccount, symbol: string): Promise
   return last === 0 ? "flat" : "open";
 }
 
+/** Two successful zero reads. One zero can be API lag right after a fill. */
+async function confirmToobitAlreadyFlat(account: ExchangeAccount, symbol: string): Promise<"flat" | "open" | "unknown"> {
+  let zeros = 0;
+  for (let i = 0; i < 3; i++) {
+    const amt = await toobitPositionAmt(account, symbol);
+    if (amt == null) {
+      zeros = 0;
+    } else if (!amt) {
+      zeros += 1;
+      if (zeros >= 2) return "flat";
+    } else {
+      return "open";
+    }
+    if (i < 2) await sleep(300);
+  }
+  return "unknown";
+}
+
 async function marketCloseToobit(account: ExchangeAccount, symbol: string): Promise<PlaceOrderResult> {
   if (!account.apiKey || !account.apiSecret) return { ok: false, message: "Toobit API key missing" };
   const amt = await toobitPositionAmt(account, symbol);
   if (amt == null) return { ok: false, message: "Toobit position read failed before close" };
-  if (!amt) return { ok: true, message: "flat" };
+  if (!amt) {
+    const confirmed = await confirmToobitAlreadyFlat(account, symbol);
+    if (confirmed === "flat") return { ok: true, message: "flat" };
+    if (confirmed !== "open") {
+      return { ok: false, message: "Toobit close unconfirmed — SL/TP left in place" };
+    }
+  }
   const json = await signed(account.apiKey, account.apiSecret, "GET", "/api/v1/futures/positions", {
     symbol,
   });
   const rows = asRows(json) as Array<{ position: string; side?: string }> | null;
   if (!rows) return { ok: false, message: "Toobit position read failed before close" };
   const row = rows.find((r) => Number(r.position) !== 0) ?? rows[0];
-  if (!row || Number(row.position) === 0) return { ok: true, message: "flat" };
+  if (!row || Number(row.position) === 0) {
+    const confirmed = await confirmToobitAlreadyFlat(account, symbol);
+    if (confirmed === "flat") return { ok: true, message: "flat" };
+    return { ok: false, message: "Toobit close unconfirmed — SL/TP left in place" };
+  }
   const sideLabel = (row.side ?? "").toUpperCase();
   const long = sideLabel === "LONG" || (sideLabel !== "SHORT" && Number(row.position) > 0);
   const side = long ? "SELL_CLOSE" : "BUY_CLOSE";
